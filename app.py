@@ -1,25 +1,26 @@
 # -*- coding: utf-8 -*-
 """Сайт выбора места (очереди) для сдачи лабораторной работы.
 
-Backend: Flask + SQLite, отдаёт JSON API и один HTML-каркас.
+Backend: Flask + SQLite/Postgres, отдаёт JSON API и один HTML-каркас.
 Frontend: Vue 3 (static/app.js), подключается без сборки.
 
 Правила работы:
   * войти на сайт можно в любое время;
-  * пожелания принимаются только с 20:00 до 21:00;
-  * администратор (Пархачева Екатерина) формирует отчёты когда угодно;
-  * в 19:55 все пожелания стираются, сайт готов к новому расчёту;
-  * после расчёта участники могут предлагать друг другу обмен местами.
+  * пожелания принимаются по расписанию листа, который завёл администратор
+    (дни недели и время задаются для каждого листа отдельно);
+  * за 5 минут до открытия приёма пожелания листа стираются;
+  * после расчёта участники видят очередь целиком и могут меняться местами.
 """
 
 import io
 import os
+import re
 import csv
 import time as time_mod
 import zipfile
 import secrets
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import (Flask, render_template, request, session, jsonify,
@@ -27,6 +28,7 @@ from flask import (Flask, render_template, request, session, jsonify,
 
 import db
 import assignment
+import report_import
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SECRET_FILE = os.path.join(db.DATA_DIR, "secret.key")
@@ -56,7 +58,7 @@ app.config["JSON_AS_ASCII"] = False
 STATUS_TEXT = {
     "satisfied": "пожелание учтено",
     "missed": "пожелание не учтено (ближайшее возможное место)",
-    "indifferent": "пожеланий не было, место назначено случайно",
+    "indifferent": "не голосовал, место назначено случайно",
 }
 
 SWAP_STATUS_TEXT = {
@@ -119,49 +121,55 @@ def api_admin_required(view):
     return wrapper
 
 
-_reset_checked_for = None
+_reset_checked_at = None
 
 
 @app.before_request
 def before_any_request():
-    """Гарантирует, что сброс в 19:55 произойдёт, даже если сервер был выключен.
+    """Готовит листы к приёму, даже если сервер в нужный момент был выключен.
 
-    Проверка делается не чаще раза в день на процесс: до 19:55 делать нечего,
-    а после первого срабатывания повторно ходить в базу незачем.
+    Проверка не чаще раза в минуту на процесс — сами сбросы защищены отметкой
+    в настройках и за день выполняются ровно один раз на лист.
     """
-    global _reset_checked_for
+    global _reset_checked_at
     now = db.local_now()
-    if now.time() < db.RESET_AT:
+    if _reset_checked_at and (now - _reset_checked_at).total_seconds() < 60:
         return
-    today = now.strftime("%Y-%m-%d")
-    if _reset_checked_for == today:
-        return
+    _reset_checked_at = now
     conn = get_conn()
     try:
-        db.ensure_daily_reset(conn, now)
-        _reset_checked_for = today
+        db.ensure_list_resets(conn, now)
     finally:
         conn.close()
-
-
-def window_payload(conn):
-    state, hint = db.window_state(conn)
-    return {
-        "state": state,
-        "hint": hint,
-        "open_from": db.OPEN_FROM.strftime("%H:%M"),
-        "open_to": db.OPEN_TO.strftime("%H:%M"),
-        "reset_at": db.RESET_AT.strftime("%H:%M"),
-        "seconds_to_open": db.seconds_to_open(),
-        "seconds_to_reset": db.seconds_to_reset(),
-        "test_mode": db.test_mode(conn),
-    }
 
 
 def user_payload(user):
     return {"id": user["id"], "full_name": user["full_name"],
             "surname": user["surname"], "name": user["name"],
             "is_admin": bool(user["is_admin"])}
+
+
+def window_payload(conn, lst, now=None):
+    state, hint = db.list_window(conn, lst, now)
+    return {"state": state, "hint": hint,
+            "seconds_to_open": db.seconds_to_open(lst, now)}
+
+
+def list_brief(conn, lst, now=None):
+    return {
+        "id": lst["id"],
+        "name": lst["name"],
+        "description": lst["description"],
+        "weekdays": lst["weekdays"],
+        "open_from": lst["open_from"],
+        "open_to": lst["open_to"],
+        "active": bool(lst["active"]),
+        "places": db.list_places(conn, lst),
+        "places_setting": lst["places"],
+        "schedule_text": db.schedule_text(lst),
+        "scheduled_today": db.is_scheduled_on(lst, (now or db.local_now()).date()),
+        "window": window_payload(conn, lst, now),
+    }
 
 
 # ------------------------------------------------------------------ каркас
@@ -181,7 +189,7 @@ def healthz():
         conn = get_conn()
         try:
             info["users"] = len(db.all_users(conn))
-            info["window"] = db.window_state(conn)[0]
+            info["lists"] = len(db.all_lists(conn))
         finally:
             conn.close()
     except Exception as exc:                      # noqa: BLE001
@@ -201,7 +209,8 @@ def api_session():
         user = current_user(conn)
         return jsonify({
             "user": user_payload(user) if user else None,
-            "window": window_payload(conn),
+            "test_mode": db.test_mode(conn),
+            "reset_lead": db.RESET_LEAD_MINUTES,
             "server_time": db.local_now().strftime("%d.%m.%Y %H:%M:%S"),
         })
     finally:
@@ -224,7 +233,7 @@ def api_login():
         session["user_id"] = user["id"]
         db.log(conn, user["full_name"], "LOGIN",
                "вход выполнен%s" % (" (администратор)" if user["is_admin"] else ""))
-        return jsonify({"user": user_payload(user), "window": window_payload(conn)})
+        return jsonify({"user": user_payload(user)})
     finally:
         conn.close()
 
@@ -256,58 +265,108 @@ def swap_payload(row, me_id):
     }
 
 
+def list_state_for_user(conn, lst, user, day, now):
+    """Всё, что участник видит про один лист."""
+    info = list_brief(conn, lst, now)
+    info["can_edit"] = info["window"]["state"] == "open"
+
+    pref = db.get_preference(conn, lst["id"], day, user["id"])
+    info["pref"] = ({"p1": pref["p1"], "p2": pref["p2"], "p3": pref["p3"],
+                     "updated_at": pref["updated_at"]} if pref else None)
+
+    members = db.list_member_rows(conn, lst["id"])
+    voted = db.all_preferences(conn, lst["id"], day)
+    voted_ids = {p["user_id"] for p in voted}
+    info["members_total"] = len(members)
+    info["voted"] = [{"full_name": m["full_name"], "is_me": m["id"] == user["id"]}
+                     for m in members if m["id"] in voted_ids]
+    info["not_voted"] = [{"full_name": m["full_name"], "is_me": m["id"] == user["id"]}
+                         for m in members if m["id"] not in voted_ids]
+
+    report_day = db.latest_report_day(conn, lst["id"])
+    info["report_day"] = report_day
+    info["queue"] = []
+    info["candidates"] = []
+    info["swaps"] = []
+    info["my_result"] = None
+
+    if report_day:
+        rows = db.get_results(conn, lst["id"], report_day)
+        info["queue"] = [{
+            "place": r["place"], "full_name": r["full_name"],
+            "status": r["status"], "status_text": STATUS_TEXT.get(r["status"], r["status"]),
+            "voted": r["status"] != "indifferent",
+            "rank": r["rank"], "swapped": bool(r["swapped"]),
+            "is_me": r["user_id"] == user["id"],
+        } for r in rows]
+        mine = db.get_result(conn, lst["id"], report_day, user["id"])
+        if mine:
+            info["my_result"] = {
+                "place": mine["place"], "status": mine["status"],
+                "status_text": STATUS_TEXT.get(mine["status"], mine["status"]),
+                "rank": mine["rank"], "wishes": mine["wishes"],
+                "swapped": bool(mine["swapped"]),
+            }
+            info["candidates"] = [{"user_id": r["user_id"], "full_name": r["full_name"],
+                                   "place": r["place"]}
+                                  for r in rows if r["user_id"] != user["id"]]
+            info["swaps"] = [swap_payload(s, user["id"]) for s in
+                             db.swaps_for_user(conn, lst["id"], report_day, user["id"])]
+    return info
+
+
 @app.route("/api/user/state")
 @api_login_required
 def api_user_state(conn, user):
-    day = today_str()
-    pref = db.get_preference(conn, day, user["id"])
-    state, _ = db.window_state(conn)
-    can_edit = (state == "open")
+    now = db.local_now()
+    day = now.strftime("%Y-%m-%d")
+    lists = [list_state_for_user(conn, lst, user, day, now)
+             for lst in db.user_lists(conn, user["id"])]
 
-    report_day = db.latest_report_day(conn)
-    my_result = db.get_result(conn, report_day, user["id"]) if report_day else None
-
-    candidates, swaps = [], []
-    if report_day and my_result:
-        for row in db.get_results(conn, report_day):
-            if row["user_id"] != user["id"]:
-                candidates.append({"user_id": row["user_id"],
-                                   "full_name": row["full_name"],
-                                   "place": row["place"]})
-        swaps = [swap_payload(s, user["id"])
-                 for s in db.swaps_for_user(conn, report_day, user["id"])]
+    # Сначала то, что принимается сегодня (по времени открытия), потом остальное.
+    lists.sort(key=lambda x: (not x["scheduled_today"], x["open_from"], x["name"]))
 
     return jsonify({
         "day": day,
-        "places": db.places_count(conn),
-        "can_edit": can_edit,
+        "server_time": now.strftime("%d.%m.%Y %H:%M:%S"),
+        "reset_lead": db.RESET_LEAD_MINUTES,
         "password_is_default": db.check_password(
             db.DEFAULT_PASSWORD, user["pwd_hash"], user["pwd_salt"]),
-        "pref": ({"p1": pref["p1"], "p2": pref["p2"], "p3": pref["p3"],
-                  "updated_at": pref["updated_at"]} if pref else None),
-        "report_day": report_day,
-        "my_result": ({"place": my_result["place"], "status": my_result["status"],
-                       "status_text": STATUS_TEXT.get(my_result["status"], my_result["status"]),
-                       "rank": my_result["rank"], "wishes": my_result["wishes"],
-                       "swapped": bool(my_result["swapped"])} if my_result else None),
-        "candidates": candidates,
-        "swaps": swaps,
-        "window": window_payload(conn),
+        "lists": lists,
     })
+
+
+def _member_list_or_error(conn, user, list_id):
+    """Возвращает (лист, None) либо (None, ответ с ошибкой)."""
+    lst = db.get_list(conn, list_id) if list_id else None
+    if not lst:
+        return None, fail("Лист не найден.", 404)
+    if not db.is_member(conn, lst["id"], user["id"]):
+        return None, fail("Вы не входите в состав листа «%s»." % lst["name"], 403)
+    return lst, None
 
 
 @app.route("/api/user/prefs", methods=["POST"])
 @api_login_required
 def api_save_prefs(conn, user):
-    day = today_str()
-    state, hint = db.window_state(conn)
-    if state != "open":
-        db.log(conn, user["full_name"], "PREFS_DENIED", hint, level="WARNING")
-        return fail("Пожелания принимаются только с %s до %s. %s" % (
-            db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M"), hint), 403)
-
     data = request.get_json(silent=True) or {}
-    places = db.places_count(conn)
+    try:
+        list_id = int(data.get("list_id"))
+    except (TypeError, ValueError):
+        return fail("Не указан лист голосования.")
+
+    lst, error = _member_list_or_error(conn, user, list_id)
+    if error:
+        return error
+
+    state, hint = db.list_window(conn, lst)
+    if state != "open":
+        db.log(conn, user["full_name"], "PREFS_DENIED",
+               "«%s»: %s" % (lst["name"], hint), level="WARNING")
+        return fail("«%s»: пожелания принимаются %s. %s"
+                    % (lst["name"], db.schedule_text(lst), hint), 403)
+
+    places = db.list_places(conn, lst)
     try:
         picks = [int(data.get("p1")), int(data.get("p2")), int(data.get("p3"))]
     except (TypeError, ValueError):
@@ -317,29 +376,46 @@ def api_save_prefs(conn, user):
     if len(set(picks)) != 3:
         return fail("Три места должны быть разными.")
 
-    old = db.get_preference(conn, day, user["id"])
-    db.save_preference(conn, day, user["id"], *picks)
+    day = today_str()
+    old = db.get_preference(conn, lst["id"], day, user["id"])
+    db.save_preference(conn, lst["id"], day, user["id"], *picks)
     wish_text = ", ".join(str(p) for p in picks)
     if old:
         db.log(conn, user["full_name"], "PREFS_EDIT",
-               "было: %d, %d, %d -> стало: %s" % (old["p1"], old["p2"], old["p3"], wish_text))
-        message = "Пожелания обновлены: %s." % wish_text
+               "«%s»: было %d, %d, %d -> стало %s"
+               % (lst["name"], old["p1"], old["p2"], old["p3"], wish_text))
+        message = "«%s»: пожелания обновлены (%s)." % (lst["name"], wish_text)
     else:
-        db.log(conn, user["full_name"], "PREFS_SAVE", "выбраны места: %s" % wish_text)
-        message = "Пожелания зафиксированы: %s." % wish_text
+        db.log(conn, user["full_name"], "PREFS_SAVE",
+               "«%s»: выбраны места %s" % (lst["name"], wish_text))
+        message = "«%s»: пожелания зафиксированы (%s)." % (lst["name"], wish_text)
     return jsonify({"ok": True, "message": message})
 
 
 @app.route("/api/user/prefs", methods=["DELETE"])
 @api_login_required
 def api_delete_prefs(conn, user):
-    state, _ = db.window_state(conn)
+    data = request.get_json(silent=True) or {}
+    raw = data.get("list_id") or request.args.get("list_id")
+    try:
+        list_id = int(raw)
+    except (TypeError, ValueError):
+        return fail("Не указан лист голосования.")
+
+    lst, error = _member_list_or_error(conn, user, list_id)
+    if error:
+        return error
+
+    state, hint = db.list_window(conn, lst)
     if state != "open":
-        return fail("Изменение пожеланий возможно только с %s до %s." % (
-            db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M")), 403)
-    db.delete_preference(conn, today_str(), user["id"])
-    db.log(conn, user["full_name"], "PREFS_DELETE", "пожелания отозваны")
-    return jsonify({"ok": True, "message": "Пожелания удалены. Место будет выдано случайно."})
+        return fail("«%s»: изменение пожеланий возможно %s. %s"
+                    % (lst["name"], db.schedule_text(lst), hint), 403)
+
+    db.delete_preference(conn, lst["id"], today_str(), user["id"])
+    db.log(conn, user["full_name"], "PREFS_DELETE", "«%s»: пожелания отозваны" % lst["name"])
+    return jsonify({"ok": True,
+                    "message": "«%s»: пожелания удалены, место будет выдано случайно."
+                               % lst["name"]})
 
 
 # --------------------------------------------------------- смена своего пароля
@@ -377,9 +453,19 @@ def api_change_own_password(conn, user):
 @api_login_required
 def api_create_swap(conn, user):
     data = request.get_json(silent=True) or {}
-    day = db.latest_report_day(conn)
+    try:
+        list_id = int(data.get("list_id"))
+    except (TypeError, ValueError):
+        return fail("Не указан лист голосования.")
+
+    lst, error = _member_list_or_error(conn, user, list_id)
+    if error:
+        return error
+
+    day = db.latest_report_day(conn, lst["id"])
     if not day:
-        return fail("Распределение ещё не сформировано — меняться пока нечем.")
+        return fail("«%s»: распределение ещё не сформировано — меняться пока нечем."
+                    % lst["name"])
 
     try:
         target_id = int(data.get("to_user_id"))
@@ -388,19 +474,20 @@ def api_create_swap(conn, user):
     if target_id == user["id"]:
         return fail("Нельзя предложить обмен самому себе.")
 
-    mine = db.get_result(conn, day, user["id"])
-    theirs = db.get_result(conn, day, target_id)
+    mine = db.get_result(conn, lst["id"], day, user["id"])
+    theirs = db.get_result(conn, lst["id"], day, target_id)
     if not mine or not theirs:
         return fail("Оба участника должны иметь место в распределении за %s." % day)
-    if db.pending_swap_between(conn, day, user["id"], target_id):
+    if db.pending_swap_between(conn, lst["id"], day, user["id"], target_id):
         return fail("Заявка между вами уже отправлена и ждёт ответа.")
 
     target = db.get_user(conn, target_id)
-    swap_id = db.create_swap(conn, day, user["id"], target_id, mine["place"], theirs["place"])
+    swap_id = db.create_swap(conn, lst["id"], day, user["id"], target_id,
+                             mine["place"], theirs["place"])
     db.log(conn, user["full_name"], "SWAP_REQUEST",
-           "предложен обмен: %s (место %d) <-> %s (место %d), заявка №%d"
-           % (user["full_name"], mine["place"], target["full_name"], theirs["place"], swap_id),
-           day=day)
+           "«%s»: предложен обмен %s (место %d) <-> %s (место %d), заявка №%d"
+           % (lst["name"], user["full_name"], mine["place"], target["full_name"],
+              theirs["place"], swap_id), day=day)
     return jsonify({"ok": True, "message": "Предложение обмена отправлено: %s (место %d)."
                                            % (target["full_name"], theirs["place"])})
 
@@ -417,16 +504,18 @@ def api_respond_swap(conn, user, swap_id):
         return fail("Заявка уже обработана (%s)."
                     % SWAP_STATUS_TEXT.get(swap["status"], swap["status"]))
 
+    lst = db.get_list(conn, swap["list_id"])
     day = swap["day"]
     author = db.get_user(conn, swap["from_user"])
     target = db.get_user(conn, swap["to_user"])
+    name = lst["name"] if lst else "лист"
 
     if action == "cancel":
         if swap["from_user"] != user["id"]:
             return fail("Отозвать заявку может только её автор.", 403)
         db.set_swap_status(conn, swap_id, "cancelled")
         db.log(conn, user["full_name"], "SWAP_CANCEL",
-               "заявка №%d отозвана" % swap_id, day=day)
+               "«%s»: заявка №%d отозвана" % (name, swap_id), day=day)
         return jsonify({"ok": True, "message": "Заявка отозвана."})
 
     if swap["to_user"] != user["id"]:
@@ -435,31 +524,148 @@ def api_respond_swap(conn, user, swap_id):
     if action == "decline":
         db.set_swap_status(conn, swap_id, "declined")
         db.log(conn, user["full_name"], "SWAP_DECLINE",
-               "отказ на заявку №%d от %s" % (swap_id, author["full_name"]), day=day)
+               "«%s»: отказ на заявку №%d от %s" % (name, swap_id, author["full_name"]),
+               day=day)
         return jsonify({"ok": True, "message": "Вы отказали в обмене."})
 
     if action != "accept":
         return fail("Неизвестное действие.")
 
-    mine = db.get_result(conn, day, user["id"])
-    theirs = db.get_result(conn, day, swap["from_user"])
+    mine = db.get_result(conn, swap["list_id"], day, user["id"])
+    theirs = db.get_result(conn, swap["list_id"], day, swap["from_user"])
     if not mine or not theirs:
         db.set_swap_status(conn, swap_id, "expired")
         return fail("Распределение изменилось, заявка больше не актуальна.")
     if mine["place"] != swap["to_place"] or theirs["place"] != swap["from_place"]:
         db.set_swap_status(conn, swap_id, "expired")
         db.log(conn, user["full_name"], "SWAP_EXPIRED",
-               "заявка №%d устарела: места уже изменились" % swap_id, level="WARNING", day=day)
+               "«%s»: заявка №%d устарела, места уже изменились" % (name, swap_id),
+               level="WARNING", day=day)
         return fail("Места уже изменились — заявка неактуальна.")
 
-    db.apply_swap(conn, day, swap["from_user"], theirs["place"], user["id"], mine["place"])
+    db.apply_swap(conn, swap["list_id"], day, swap["from_user"], theirs["place"],
+                  user["id"], mine["place"])
     db.set_swap_status(conn, swap_id, "accepted")
     db.log(conn, user["full_name"], "SWAP_ACCEPT",
-           "обмен выполнен по заявке №%d: %s теперь на месте %d, %s — на месте %d"
-           % (swap_id, author["full_name"], mine["place"], target["full_name"],
+           "«%s»: обмен по заявке №%d — %s теперь на месте %d, %s на месте %d"
+           % (name, swap_id, author["full_name"], mine["place"], target["full_name"],
               theirs["place"]), day=day)
     return jsonify({"ok": True, "message": "Обмен выполнен: ваше новое место %d."
                                            % theirs["place"]})
+
+
+# --------------------------------------------------------- листы (администратор)
+
+def admin_list_payload(conn, lst, now, day):
+    info = list_brief(conn, lst, now)
+    info["member_ids"] = db.list_member_ids(conn, lst["id"])
+    info["members_total"] = len(info["member_ids"])
+    info["submitted"] = len(db.all_preferences(conn, lst["id"], day))
+    info["report_days"] = db.report_days(conn, lst["id"])
+    meta = db.get_report_meta(conn, lst["id"], day)
+    info["meta"] = ({"created_at": meta["created_at"], "created_by": meta["created_by"],
+                     "summary": meta["summary"]} if meta else None)
+    info["last_reset"] = db.get_setting(conn, "last_reset_%d" % lst["id"])
+    return info
+
+
+@app.route("/api/admin/lists")
+@api_admin_required
+def api_admin_lists(conn, user):
+    now = db.local_now()
+    day = request.args.get("day") or today_str()
+    return jsonify({
+        "day": day,
+        "test_mode": db.test_mode(conn),
+        "reset_lead": db.RESET_LEAD_MINUTES,
+        "weekday_names": db.WEEKDAY_SHORT,
+        "users": [{"id": u["id"], "full_name": u["full_name"],
+                   "is_admin": bool(u["is_admin"])} for u in db.all_users(conn)],
+        "lists": [admin_list_payload(conn, lst, now, day) for lst in db.all_lists(conn)],
+    })
+
+
+def _list_form(data):
+    """Разбирает поля листа из запроса."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return None, "У листа должно быть название."
+    weekdays = db.clean_weekdays(data.get("weekdays"))
+    if not weekdays:
+        return None, "Выберите хотя бы один день недели."
+    open_from = db.parse_hhmm(data.get("open_from"), db.DEFAULT_OPEN_FROM)
+    open_to = db.parse_hhmm(data.get("open_to"), db.DEFAULT_OPEN_TO)
+    if open_from >= open_to:
+        return None, "Время открытия должно быть раньше времени закрытия."
+    try:
+        places = int(data.get("places") or 0)
+    except (TypeError, ValueError):
+        return None, "Количество мест должно быть числом."
+    if places < 0:
+        return None, "Количество мест не может быть отрицательным."
+    members = [int(x) for x in (data.get("member_ids") or [])]
+    if places and members and places < len(members):
+        return None, ("Мест (%d) меньше, чем участников листа (%d)."
+                      % (places, len(members)))
+    return {
+        "name": name,
+        "description": (data.get("description") or "").strip(),
+        "weekdays": weekdays,
+        "open_from": open_from.strftime("%H:%M"),
+        "open_to": open_to.strftime("%H:%M"),
+        "places": places,
+        "active": 1 if data.get("active", True) else 0,
+        "member_ids": members,
+    }, None
+
+
+@app.route("/api/admin/lists", methods=["POST"])
+@api_admin_required
+def api_admin_create_list(conn, user):
+    form, error = _list_form(request.get_json(silent=True) or {})
+    if error:
+        return fail(error)
+    list_id = db.create_list(conn, form["name"], form["description"], form["weekdays"],
+                             form["open_from"], form["open_to"], form["places"],
+                             form["active"], form["member_ids"])
+    db.log(conn, user["full_name"], "LIST_CREATE",
+           "создан лист «%s»: %s, участников %d"
+           % (form["name"], db.schedule_text(db.get_list(conn, list_id)),
+              len(form["member_ids"])))
+    return jsonify({"ok": True, "list_id": list_id,
+                    "message": "Лист «%s» создан." % form["name"]})
+
+
+@app.route("/api/admin/lists/<int:list_id>", methods=["POST"])
+@api_admin_required
+def api_admin_update_list(conn, user, list_id):
+    lst = db.get_list(conn, list_id)
+    if not lst:
+        return fail("Лист не найден.", 404)
+    form, error = _list_form(request.get_json(silent=True) or {})
+    if error:
+        return fail(error)
+    db.update_list(conn, list_id, form["name"], form["description"], form["weekdays"],
+                   form["open_from"], form["open_to"], form["places"], form["active"])
+    db.set_list_members(conn, list_id, form["member_ids"])
+    db.log(conn, user["full_name"], "LIST_UPDATE",
+           "изменён лист «%s»: %s, участников %d, %s"
+           % (form["name"], db.schedule_text(db.get_list(conn, list_id)),
+              len(form["member_ids"]), "включён" if form["active"] else "выключен"))
+    return jsonify({"ok": True, "message": "Лист «%s» сохранён." % form["name"]})
+
+
+@app.route("/api/admin/lists/<int:list_id>/delete", methods=["POST"])
+@api_admin_required
+def api_admin_delete_list(conn, user, list_id):
+    lst = db.get_list(conn, list_id)
+    if not lst:
+        return fail("Лист не найден.", 404)
+    db.delete_list(conn, list_id)
+    db.log(conn, user["full_name"], "LIST_DELETE",
+           "удалён лист «%s» вместе с его пожеланиями и распределениями" % lst["name"],
+           level="WARNING")
+    return jsonify({"ok": True, "message": "Лист «%s» удалён." % lst["name"]})
 
 
 # ------------------------------------------------------ раздел администратора
@@ -468,29 +674,34 @@ def api_respond_swap(conn, user, swap_id):
 @api_admin_required
 def api_admin_overview(conn, user):
     day = request.args.get("day") or today_str()
-    prefs = {p["user_id"]: p for p in db.all_preferences(conn, day)}
+    now = db.local_now()
+    lists = db.all_lists(conn)
+    try:
+        list_id = int(request.args.get("list_id") or 0)
+    except (TypeError, ValueError):
+        list_id = 0
+    current = db.get_list(conn, list_id) if list_id else (lists[0] if lists else None)
+    if not current:
+        return jsonify({"day": day, "lists": [], "list": None, "people": [],
+                        "test_mode": db.test_mode(conn), "events": []})
+
+    prefs = {p["user_id"]: p for p in db.all_preferences(conn, current["id"], day)}
     people = []
-    for u in db.all_users(conn):
+    for u in db.list_member_rows(conn, current["id"]):
         p = prefs.get(u["id"])
         people.append({
             "id": u["id"], "full_name": u["full_name"], "is_admin": bool(u["is_admin"]),
             "wishes": ("%d, %d, %d" % (p["p1"], p["p2"], p["p3"])) if p else None,
             "updated_at": p["updated_at"] if p else None,
         })
-    meta = db.get_report_meta(conn, day)
+
     return jsonify({
         "day": day,
-        "places": db.places_count(conn),
         "test_mode": db.test_mode(conn),
-        "password_is_default": db.check_password(
-            db.DEFAULT_PASSWORD, user["pwd_hash"], user["pwd_salt"]),
+        "lists": [{"id": x["id"], "name": x["name"]} for x in lists],
+        "list": admin_list_payload(conn, current, now, day),
         "people": people,
         "submitted": len(prefs),
-        "meta": ({"created_at": meta["created_at"], "created_by": meta["created_by"],
-                  "summary": meta["summary"]} if meta else None),
-        "report_days": db.report_days(conn),
-        "last_reset": db.get_setting(conn, "last_reset"),
-        "window": window_payload(conn),
         "events": [dict(e) for e in db.read_events(conn, day, day)[-60:]],
     })
 
@@ -526,24 +737,12 @@ def api_admin_password(conn, user):
 @api_admin_required
 def api_admin_settings(conn, user):
     data = request.get_json(silent=True) or {}
-    users_total = len(db.all_users(conn))
-    raw_places = data.get("places_count")
-    if raw_places not in (None, ""):
-        try:
-            value = int(raw_places)
-        except (TypeError, ValueError):
-            return fail("Число мест должно быть целым.")
-        if value < users_total:
-            return fail("Мест не может быть меньше числа участников (%d)." % users_total)
-        db.set_setting(conn, "places_count", value)
-        db.log(conn, user["full_name"], "SETTINGS", "количество мест: %d" % value)
-
     if "test_mode" in data:
         new_mode = "1" if data.get("test_mode") else "0"
         if new_mode != db.get_setting(conn, "test_mode", "0"):
             db.set_setting(conn, "test_mode", new_mode)
             db.log(conn, user["full_name"], "SETTINGS",
-                   "режим отладки (круглосуточный доступ): %s"
+                   "режим отладки (приём открыт круглосуточно): %s"
                    % ("включён" if new_mode == "1" else "выключен"), level="WARNING")
     return jsonify({"ok": True, "message": "Настройки сохранены."})
 
@@ -551,64 +750,110 @@ def api_admin_settings(conn, user):
 @app.route("/api/admin/reset", methods=["POST"])
 @api_admin_required
 def api_admin_reset(conn, user):
-    prefs, swaps = db.reset_day(conn, user["full_name"], "ручная подготовка к новому расчёту")
+    data = request.get_json(silent=True) or {}
+    raw = data.get("list_id")
+    if raw:
+        lst = db.get_list(conn, int(raw))
+        if not lst:
+            return fail("Лист не найден.", 404)
+        prefs, swaps = db.reset_list(conn, lst, user["full_name"],
+                                     "ручная подготовка к новому расчёту",
+                                     include_today=True)
+        where = "«%s»" % lst["name"]
+    else:
+        prefs, swaps = db.reset_all_lists(conn, user["full_name"])
+        where = "все листы"
     return jsonify({"ok": True,
-                    "message": "Сайт подготовлен к новому дню: стёрто пожеланий %d, "
-                               "отменено заявок на обмен %d." % (prefs, swaps)})
+                    "message": "%s: стёрто пожеланий %d, отменено заявок на обмен %d."
+                               % (where, prefs, swaps)})
 
 
 @app.route("/api/admin/compute", methods=["POST"])
 @api_admin_required
 def api_admin_compute(conn, user):
     data = request.get_json(silent=True) or {}
-    day = data.get("day") or today_str()
-    places = db.places_count(conn)
-    participants = [(u["id"], u["full_name"]) for u in db.all_users(conn)]
-    prefs = {p["user_id"]: (p["p1"], p["p2"], p["p3"])
-             for p in db.all_preferences(conn, day)}
+    try:
+        list_id = int(data.get("list_id"))
+    except (TypeError, ValueError):
+        return fail("Не указан лист голосования.")
+    lst = db.get_list(conn, list_id)
+    if not lst:
+        return fail("Лист не найден.", 404)
 
-    state, _ = db.window_state(conn)
+    day = data.get("day") or today_str()
+    places = db.list_places(conn, lst)
+    members = db.list_member_rows(conn, lst["id"])
+    if not members:
+        return fail("В листе «%s» нет участников." % lst["name"])
+    participants = [(u["id"], u["full_name"]) for u in members]
+    pref_rows = db.all_preferences(conn, lst["id"], day)
+    prefs = {p["user_id"]: (p["p1"], p["p2"], p["p3"]) for p in pref_rows}
+    # Очередь голосования: кто раньше отдал пожелания, тот в приоритете, если
+    # несколько раскладов одинаково хороши.
+    by_time = sorted(pref_rows, key=lambda p: (p["updated_at"], p["user_id"]))
+    order = {p["user_id"]: idx for idx, p in enumerate(by_time)}
+
+    state, _ = db.list_window(conn, lst)
     if day == today_str() and state == "open":
         db.log(conn, user["full_name"], "CALC_EARLY",
-               "расчёт запущен до закрытия приёма пожеланий", level="WARNING", day=day)
+               "«%s»: расчёт запущен до закрытия приёма пожеланий" % lst["name"],
+               level="WARNING", day=day)
 
     db.log(conn, user["full_name"], "CALC_START",
-           "расчёт распределения за %s: участников %d, пожеланий %d, мест %d"
-           % (day, len(participants), len(prefs), places), day=day)
+           "«%s» за %s: участников %d, пожеланий %d, мест %d"
+           % (lst["name"], day, len(participants), len(prefs), places), day=day)
+    if by_time:
+        db.log(conn, "РАСЧЁТ «%s»" % lst["name"], "CALC_ORDER",
+               "очередь голосования: %s"
+               % "; ".join("%d) %s в %s" % (i + 1, p["full_name"], p["updated_at"])
+                           for i, p in enumerate(by_time)), day=day)
 
     try:
-        rows, log_lines, stats = assignment.solve(participants, prefs, places)
+        rows, log_lines, stats = assignment.solve(participants, prefs, places, order=order)
     except ValueError as exc:
-        db.log(conn, user["full_name"], "CALC_ERROR", str(exc), level="ERROR", day=day)
+        db.log(conn, user["full_name"], "CALC_ERROR", "«%s»: %s" % (lst["name"], exc),
+               level="ERROR", day=day)
         return fail("Расчёт невозможен: %s" % exc)
 
     for line in log_lines:
         if line:
-            db.log(conn, "РАСЧЁТ", "CALC", line, day=day)
+            db.log(conn, "РАСЧЁТ «%s»" % lst["name"], "CALC", line, day=day)
 
     summary = ("Учтено пожеланий: %d из %d (1-е: %d, 2-е: %d, 3-е: %d); "
                "не учтено: %d; без пожеланий: %d"
                % (stats["satisfied"], stats["voters"], stats["rank1"], stats["rank2"],
                   stats["rank3"], stats["missed"], stats["silent"]))
 
-    db.save_results(conn, day,
-                    [(day, r["user_id"], r["place"], r["status"], r["rank"], r["wishes"])
-                     for r in rows], user["full_name"], summary)
-    db.log(conn, user["full_name"], "CALC_DONE", summary, day=day)
-    return jsonify({"ok": True, "day": day, "summary": summary,
-                    "message": "Распределение за %s сформировано." % day})
+    db.save_results(conn, lst["id"], day,
+                    [(lst["id"], day, r["user_id"], r["place"], r["status"], r["rank"],
+                      r["wishes"]) for r in rows], user["full_name"], summary)
+    db.log(conn, user["full_name"], "CALC_DONE", "«%s»: %s" % (lst["name"], summary),
+           day=day)
+    return jsonify({"ok": True, "day": day, "list_id": lst["id"], "summary": summary,
+                    "message": "«%s»: распределение за %s сформировано."
+                               % (lst["name"], day)})
 
 
 @app.route("/api/admin/report")
 @api_admin_required
 def api_admin_report(conn, user):
+    try:
+        list_id = int(request.args.get("list_id") or 0)
+    except (TypeError, ValueError):
+        return fail("Не указан лист голосования.")
+    lst = db.get_list(conn, list_id)
+    if not lst:
+        return fail("Лист не найден.", 404)
     day = request.args.get("day") or today_str()
-    results = db.get_results(conn, day)
+    results = db.get_results(conn, lst["id"], day)
     if not results:
-        return fail("За %s распределение ещё не формировалось." % day, 404)
-    meta = db.get_report_meta(conn, day)
+        return fail("«%s»: распределение за %s не формировалось." % (lst["name"], day), 404)
+    meta = db.get_report_meta(conn, lst["id"], day)
     return jsonify({
         "day": day,
+        "list": {"id": lst["id"], "name": lst["name"],
+                 "description": lst["description"],
+                 "schedule_text": db.schedule_text(lst)},
         "meta": {"created_at": meta["created_at"], "created_by": meta["created_by"],
                  "summary": meta["summary"]} if meta else None,
         "rows": [{"place": r["place"], "surname": r["surname"], "name": r["name"],
@@ -621,7 +866,7 @@ def api_admin_report(conn, user):
                    "status": s["status"],
                    "status_text": SWAP_STATUS_TEXT.get(s["status"], s["status"]),
                    "created_at": s["created_at"], "resolved_at": s["resolved_at"]}
-                  for s in db.swaps_for_day(conn, day)],
+                  for s in db.swaps_for_day(conn, lst["id"], day)],
         "events": [dict(e) for e in db.read_events(conn, day, day)],
     })
 
@@ -643,13 +888,16 @@ def api_admin_logs(conn, user):
 
 # ------------------------------------------------------------------ выгрузки
 
-def _report_csv(conn, day):
-    results = db.get_results(conn, day)
-    meta = db.get_report_meta(conn, day)
+def _report_csv(conn, lst, day):
+    results = db.get_results(conn, lst["id"], day)
+    meta = db.get_report_meta(conn, lst["id"], day)
     created = meta["created_at"] if meta else db.local_now().strftime("%Y-%m-%d %H:%M:%S")
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";", lineterminator="\r\n")
     writer.writerow(["Отчёт по очереди сдачи лабораторной работы"])
+    writer.writerow(["Лист", lst["name"]])
+    writer.writerow(["Описание", lst["description"]])
+    writer.writerow(["Расписание приёма", db.schedule_text(lst)])
     writer.writerow(["Дата сдачи", day])
     writer.writerow(["Дата формирования", created])
     if meta:
@@ -663,6 +911,110 @@ def _report_csv(conn, day):
                          row["wishes"] or "-", STATUS_TEXT.get(row["status"], row["status"]),
                          row["rank"] or "-", "да" if row["swapped"] else "нет"])
     return buf.getvalue()
+
+
+@app.route("/api/admin/import", methods=["POST"])
+@api_admin_required
+def api_admin_import(conn, user):
+    """Загружает ранее выгруженный CSV обратно как готовое распределение."""
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        return fail("Файл не выбран.")
+    try:
+        parsed = report_import.parse_report_csv(
+            report_import.decode_csv(upload.read()))
+    except ValueError as exc:
+        db.log(conn, user["full_name"], "IMPORT_ERROR",
+               "файл %s не разобран: %s" % (upload.filename, exc), level="WARNING")
+        return fail("Не удалось прочитать файл: %s" % exc)
+
+    # 1. В какой лист загружаем: выбранный вручную или найденный по названию.
+    raw_list = (request.form.get("list_id") or "").strip()
+    if raw_list.isdigit():
+        lst = db.get_list(conn, int(raw_list))
+    else:
+        lst = None
+        for candidate in db.all_lists(conn):
+            if candidate["name"].strip().lower() == parsed["list_name"].lower():
+                lst = candidate
+                break
+        if not lst:
+            return fail("В файле указан лист «%s», но такого листа на сайте нет — "
+                        "выберите лист вручную." % parsed["list_name"])
+    if not lst:
+        return fail("Лист не найден.", 404)
+
+    day = (request.form.get("day") or parsed["day"]).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        return fail("В файле не указана дата сдачи — задайте её вручную.")
+
+    # 2. Сопоставляем людей из файла с участниками сайта.
+    members = {u["id"]: u for u in db.list_member_rows(conn, lst["id"])}
+    by_key = {db.login_key("%s %s" % (u["surname"], u["name"])): u
+              for u in db.all_users(conn)}
+    resolved, unknown, outsiders = [], [], []
+    for row in parsed["rows"]:
+        person = by_key.get(db.login_key("%s %s" % (row["surname"], row["name"])))
+        if not person:
+            unknown.append("строка %d: %s %s" % (row["line"], row["surname"], row["name"]))
+            continue
+        if person["id"] not in members:
+            outsiders.append(person["full_name"])
+        resolved.append((person, row))
+    if unknown:
+        return fail("В файле есть люди, которых нет в списке: %s."
+                    % "; ".join(unknown[:5]))
+
+    # 3. Проверяем, что очередь корректная.
+    places = [row["place"] for _, row in resolved]
+    duplicates = sorted({p for p in places if places.count(p) > 1})
+    if duplicates:
+        return fail("Одно и то же место занято несколько раз: %s."
+                    % ", ".join(str(p) for p in duplicates))
+    ids = [person["id"] for person, _ in resolved]
+    if len(set(ids)) != len(ids):
+        return fail("Один и тот же человек встречается в файле дважды.")
+    limit = db.list_places(conn, lst)
+    beyond = [p for p in places if p < 1 or p > limit]
+    if beyond:
+        return fail("В листе «%s» всего %d мест, а в файле есть место %d."
+                    % (lst["name"], limit, beyond[0]))
+
+    # 4. Записываем распределение.
+    existed = bool(db.get_results(conn, lst["id"], day))
+    summary = parsed["summary"] or ("загружено из файла %s" % upload.filename)
+    db.save_results(conn, lst["id"], day,
+                    [(lst["id"], day, person["id"], row["place"], row["status"],
+                      row["rank"], row["wishes"]) for person, row in resolved],
+                    "загрузка файла (%s)" % user["full_name"], summary)
+    for person, row in resolved:
+        if row["swapped"]:
+            conn.execute("UPDATE results SET swapped = 1 WHERE list_id = ? AND day = ?"
+                         " AND user_id = ?", (lst["id"], day, person["id"]))
+    conn.execute("UPDATE swaps SET status = 'expired', resolved_at = ? WHERE list_id = ?"
+                 " AND day = ? AND status = 'pending'",
+                 (db.local_now().strftime("%Y-%m-%d %H:%M:%S"), lst["id"], day))
+    conn.commit()
+
+    warnings = []
+    missing = [u["full_name"] for uid, u in members.items()
+               if uid not in {person["id"] for person, _ in resolved}]
+    if missing:
+        warnings.append("состоят в листе, но их нет в файле: %s" % ", ".join(missing))
+    if outsiders:
+        warnings.append("есть в файле, но не состоят в листе: %s" % ", ".join(outsiders))
+    if existed:
+        warnings.append("прежнее распределение за %s заменено" % day)
+
+    db.log(conn, user["full_name"], "IMPORT",
+           "«%s» за %s: загружено распределение из файла %s, строк %d%s"
+           % (lst["name"], day, upload.filename, len(resolved),
+              ("; " + "; ".join(warnings)) if warnings else ""),
+           level="WARNING", day=day)
+    return jsonify({"ok": True, "list_id": lst["id"], "day": day,
+                    "imported": len(resolved), "warnings": warnings,
+                    "message": "«%s»: загружено распределение за %s (%d человек)."
+                               % (lst["name"], day, len(resolved))})
 
 
 def _report_log(conn, day):
@@ -684,16 +1036,24 @@ def _download_guard():
     return conn, user
 
 
-@app.route("/download/report/<day>.csv")
-def download_csv(day):
+def _safe_name(text):
+    """Название листа, пригодное для имени файла."""
+    return re.sub(r"[^\w\-. ]+", "_", text, flags=re.UNICODE).strip() or "лист"
+
+
+@app.route("/download/report/<int:list_id>/<day>.csv")
+def download_csv(list_id, day):
     conn, user = _download_guard()
     try:
-        if not db.get_results(conn, day):
+        lst = db.get_list(conn, list_id)
+        if not lst or not db.get_results(conn, list_id, day):
             abort(404)
-        data = ("﻿" + _report_csv(conn, day)).encode("utf-8")
-        db.log(conn, user["full_name"], "EXPORT_CSV", "выгрузка отчёта за %s" % day, day=day)
+        data = ("﻿" + _report_csv(conn, lst, day)).encode("utf-8")
+        db.log(conn, user["full_name"], "EXPORT_CSV",
+               "«%s»: выгрузка отчёта за %s" % (lst["name"], day), day=day)
         return send_file(io.BytesIO(data), mimetype="text/csv; charset=utf-8",
-                         as_attachment=True, download_name="Очередь_%s.csv" % day)
+                         as_attachment=True,
+                         download_name="Очередь_%s_%s.csv" % (_safe_name(lst["name"]), day))
     finally:
         conn.close()
 
@@ -710,44 +1070,54 @@ def download_log(day):
         conn.close()
 
 
-@app.route("/download/report/<day>.zip")
-def download_zip(day):
+@app.route("/download/report/<int:list_id>/<day>.zip")
+def download_zip(list_id, day):
     conn, user = _download_guard()
     try:
-        if not db.get_results(conn, day):
+        lst = db.get_list(conn, list_id)
+        if not lst or not db.get_results(conn, list_id, day):
             abort(404)
+        safe = _safe_name(lst["name"])
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("Очередь_%s.csv" % day,
-                        ("﻿" + _report_csv(conn, day)).encode("utf-8"))
+            zf.writestr("Очередь_%s_%s.csv" % (safe, day),
+                        ("﻿" + _report_csv(conn, lst, day)).encode("utf-8"))
             zf.writestr("Журнал_%s.log" % day, _report_log(conn, day).encode("utf-8"))
         buf.seek(0)
         db.log(conn, user["full_name"], "EXPORT_ZIP",
-               "выгрузка отчёта и журнала за %s" % day, day=day)
+               "«%s»: выгрузка отчёта и журнала за %s" % (lst["name"], day), day=day)
         return send_file(buf, mimetype="application/zip", as_attachment=True,
-                         download_name="Отчет_%s.zip" % day)
+                         download_name="Отчет_%s_%s.zip" % (safe, day))
     finally:
         conn.close()
 
 
-# ------------------------------------------------- фоновая подготовка в 19:55
+# ------------------------------------------- фоновая подготовка листов к приёму
 
 def _reset_worker():
     while True:
-        wait = min(db.seconds_to_reset(), 300)
-        time_mod.sleep(max(wait, 5))
+        wait = 300
         try:
             conn = get_conn()
             try:
-                db.ensure_daily_reset(conn)
+                wait = min(max(db.seconds_to_next_reset(conn), 10), 300)
             finally:
                 conn.close()
-        except Exception as exc:                      # noqa: BLE001
-            print("Ошибка планировщика сброса: %s" % exc)
+        except Exception as exc:                  # noqa: BLE001
+            print("Ошибка планировщика: %s" % exc)
+        time_mod.sleep(wait)
+        try:
+            conn = get_conn()
+            try:
+                db.ensure_list_resets(conn)
+            finally:
+                conn.close()
+        except Exception as exc:                  # noqa: BLE001
+            print("Ошибка подготовки листов: %s" % exc)
 
 
 def start_scheduler():
-    thread = threading.Thread(target=_reset_worker, daemon=True, name="daily-reset")
+    thread = threading.Thread(target=_reset_worker, daemon=True, name="list-reset")
     thread.start()
     return thread
 
@@ -755,13 +1125,9 @@ def start_scheduler():
 # --------------------------------------------------------------- старт сервиса
 
 def startup(seed=True, scheduler=True):
-    """Готовит приложение к работе: схема, список людей, планировщик сброса.
-
-    Вызывается и при локальном запуске, и под gunicorn на хостинге, где диск
-    может быть чистым после каждого перезапуска.
-    """
+    """Готовит приложение к работе: схема, список людей, планировщик подготовки."""
     print("Хранилище: %s" % ("Postgres (DATABASE_URL)" if db.USE_POSTGRES
-                              else "SQLite %s" % db.DB_PATH))
+                             else "SQLite %s" % db.DB_PATH))
     try:
         conn = get_conn()
         try:

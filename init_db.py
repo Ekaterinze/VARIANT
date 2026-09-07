@@ -3,8 +3,9 @@
 
 Запуск:  python init_db.py
 Стартовый пароль у всех одинаковый (a123456) — каждый участник меняет его сам
-на странице «Мой пароль». Повторный запуск безопасен: уже заведённых людей
-скрипт не трогает и пароли им не сбрасывает.
+на странице «Мой пароль». Заодно создаётся лист голосования по умолчанию со
+всеми людьми. Повторный запуск безопасен: уже заведённых людей скрипт не
+трогает и пароли им не сбрасывает.
 Чтобы начать с нуля, удалите data/lab.db и запустите скрипт снова.
 """
 
@@ -23,6 +24,7 @@ def main():
     db.init_schema(conn)
 
     created = db.import_people(conn)
+    db.ensure_default_list(conn)
     total = len(db.all_users(conn))
 
     if created:
@@ -38,12 +40,16 @@ def main():
     admin = db.get_user_by_login(conn, db.ADMIN_FULL_NAME)
     print("")
     print("Всего пользователей: %d" % total)
-    print("Мест в очереди: %d" % db.places_count(conn))
     print("Администратор: %s" % (admin["full_name"] if admin else "не найден!"))
     print("Стартовый пароль для всех: %s (меняется на сайте)" % db.DEFAULT_PASSWORD)
-    print("Приём пожеланий: с %s до %s, сброс пожеланий в %s (пояс %s)."
-          % (db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M"),
-             db.RESET_AT.strftime("%H:%M"), db.TZ_NAME))
+    print("Часовой пояс расписания: %s" % db.TZ_NAME)
+    print("")
+    print("Листы голосования:")
+    for lst in db.all_lists(conn):
+        print("  «%s» — %s, участников %d, мест %d"
+              % (lst["name"], db.schedule_text(lst),
+                 len(db.list_member_ids(conn, lst["id"])), db.list_places(conn, lst)))
+    print("Новые листы создаются в панели администратора (вкладка «Листы»).")
     print("")
     print("Запуск сайта:  python app.py   (адрес http://localhost:5000)")
     conn.close()

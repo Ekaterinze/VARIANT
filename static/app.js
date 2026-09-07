@@ -2,7 +2,7 @@
 (function () {
   "use strict";
 
-  const { createApp, reactive, ref, computed, onMounted, onUnmounted } = Vue;
+  const { createApp, reactive, ref, computed, watch, onMounted, onUnmounted } = Vue;
 
   /* ------------------------------------------------------------ уведомления */
 
@@ -38,18 +38,21 @@
   }
 
   function fmtCountdown(seconds) {
-    if (seconds === null || seconds === undefined || seconds <= 0) return "";
-    const h = Math.floor(seconds / 3600);
+    if (!seconds || seconds <= 0) return "";
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
     const pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+    if (d > 0) return d + " дн " + h + " ч";
     return (h > 0 ? h + " ч " : "") + pad(m) + ":" + pad(s);
   }
+
+  const WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
 
   /* ------------------------------------------------------------------ вход */
 
   const LoginView = {
-    props: ["window"],
     emits: ["logged-in"],
     setup(props, ctx) {
       const fio = ref("");
@@ -80,13 +83,6 @@
           <h2>Вход на сайт</h2>
           <p class="sub">Очередь сдачи лабораторной работы</p>
 
-          <div :class="['banner', window.state]" v-if="window">
-            {{ window.hint }}
-            <span v-if="window.state === 'closed' && window.countdown">
-              До открытия приёма: <b>{{ window.countdown }}</b>
-            </span>
-          </div>
-
           <form @submit.prevent="submit">
             <label for="fio">Фамилия и имя</label>
             <input id="fio" v-model="fio" placeholder="Иванова Анна" autocomplete="username">
@@ -100,9 +96,9 @@
             </div>
           </form>
           <p class="sub small" style="margin-top:16px">
-            Войти можно в любое время: посмотреть своё место и договориться об обмене.
-            Пожелания принимаются только с {{ window.open_from }} до {{ window.open_to }}
-            и стираются каждый день в {{ window.reset_at }}.
+            Войти можно в любое время: посмотреть очередь, своё место и договориться
+            об обмене. Пожелания принимаются по расписанию каждого листа — оно
+            показано на странице после входа.
           </p>
         </div>
       </div>
@@ -183,60 +179,60 @@
     `,
   };
 
-  /* ------------------------------------------------------- страница участника */
+  /* ------------------------------------------------- один лист голосования */
 
-  const UserView = {
-    props: ["user", "window"],
-    setup(props) {
-      const state = reactive({ data: null, loading: true });
+  const ListCard = {
+    props: ["list"],
+    emits: ["changed"],
+    setup(props, ctx) {
       const picks = reactive({ p1: null, p2: null, p3: null });
-      const swapTarget = ref(null);
+      const dirty = ref(false);
       const busy = ref(false);
+      const swapTarget = ref(null);
+      const showQueue = ref(true);
+      const showWho = ref(false);
 
-      const placeList = computed(function () {
-        const total = state.data ? state.data.places : 0;
-        return Array.from({ length: total }, function (_, i) { return i + 1; });
+      function syncFromServer() {
+        const pref = props.list.pref;
+        picks.p1 = pref ? pref.p1 : null;
+        picks.p2 = pref ? pref.p2 : null;
+        picks.p3 = pref ? pref.p3 : null;
+        dirty.value = false;
+      }
+      syncFromServer();
+
+      // Обновление с сервера не должно затирать то, что человек уже выбрал.
+      watch(function () { return props.list.pref; }, function () {
+        if (!dirty.value) syncFromServer();
       });
 
+      const placeList = computed(function () {
+        return Array.from({ length: props.list.places }, function (_, i) { return i + 1; });
+      });
+      const countdown = computed(function () {
+        return fmtCountdown(props.list.window.seconds_to_open);
+      });
       const incoming = computed(function () {
-        if (!state.data) return [];
-        return state.data.swaps.filter(function (s) {
+        return props.list.swaps.filter(function (s) {
           return s.direction === "incoming" && s.status === "pending";
         });
       });
       const outgoing = computed(function () {
-        if (!state.data) return [];
-        return state.data.swaps.filter(function (s) {
+        return props.list.swaps.filter(function (s) {
           return s.direction === "outgoing" && s.status === "pending";
         });
       });
-      const history = computed(function () {
-        if (!state.data) return [];
-        return state.data.swaps.filter(function (s) { return s.status !== "pending"; });
-      });
 
-      async function load() {
-        try {
-          const data = await api("/api/user/state");
-          state.data = data;
-          if (data.pref) {
-            picks.p1 = data.pref.p1;
-            picks.p2 = data.pref.p2;
-            picks.p3 = data.pref.p3;
-          }
-        } catch (e) {
-          notify(e.message, "error");
-        } finally {
-          state.loading = false;
-        }
-      }
-
-      async function savePrefs() {
+      async function save() {
         busy.value = true;
         try {
-          const data = await api("/api/user/prefs", { method: "POST", body: { ...picks } });
+          const data = await api("/api/user/prefs", {
+            method: "POST",
+            body: { list_id: props.list.id, p1: picks.p1, p2: picks.p2, p3: picks.p3 },
+          });
           notify(data.message, "ok");
-          await load();
+          dirty.value = false;
+          ctx.emit("changed");
         } catch (e) {
           notify(e.message, "error");
         } finally {
@@ -244,14 +240,18 @@
         }
       }
 
-      async function dropPrefs() {
-        if (!confirm("Удалить свои пожелания? Место будет назначено случайно.")) return;
+      async function drop() {
+        if (!confirm("Удалить свои пожелания в листе «" + props.list.name +
+                     "»? Место будет назначено случайно.")) return;
         busy.value = true;
         try {
-          const data = await api("/api/user/prefs", { method: "DELETE" });
+          const data = await api("/api/user/prefs", {
+            method: "DELETE", body: { list_id: props.list.id },
+          });
           notify(data.message, "ok");
           picks.p1 = picks.p2 = picks.p3 = null;
-          await load();
+          dirty.value = false;
+          ctx.emit("changed");
         } catch (e) {
           notify(e.message, "error");
         } finally {
@@ -264,11 +264,12 @@
         busy.value = true;
         try {
           const data = await api("/api/user/swaps", {
-            method: "POST", body: { to_user_id: swapTarget.value },
+            method: "POST",
+            body: { list_id: props.list.id, to_user_id: swapTarget.value },
           });
           notify(data.message, "ok");
           swapTarget.value = null;
-          await load();
+          ctx.emit("changed");
         } catch (e) {
           notify(e.message, "error");
         } finally {
@@ -283,7 +284,7 @@
             method: "POST", body: { action: action },
           });
           notify(data.message, "ok");
-          await load();
+          ctx.emit("changed");
         } catch (e) {
           notify(e.message, "error");
         } finally {
@@ -291,104 +292,119 @@
         }
       }
 
-      let timer = null;
-      onMounted(function () {
-        load();
-        timer = setInterval(load, 20000);   // подтягиваем новые заявки на обмен
-      });
-      onUnmounted(function () { if (timer) clearInterval(timer); });
-
-      return { state, picks, placeList, swapTarget, busy, incoming, outgoing, history,
-               savePrefs, dropPrefs, proposeSwap, respond, load };
+      return { picks, dirty, busy, swapTarget, showQueue, showWho, placeList,
+               countdown, incoming, outgoing, save, drop, proposeSwap, respond };
     },
-    components: { PasswordCard },
     template: `
-      <div v-if="state.loading" class="card">Загружаем данные…</div>
-      <div v-else-if="state.data">
-        <div :class="['banner', window.state]">
-          {{ window.hint }}
-          <span v-if="window.state === 'closed' && window.countdown">
-            До открытия: <b>{{ window.countdown }}</b>
+      <div class="card">
+        <div class="list-head">
+          <h2>{{ list.name }}</h2>
+          <span class="pill" :class="list.window.state === 'open' ? 'ok' : 'muted'">
+            {{ list.window.state === 'open' ? 'приём открыт' : 'приём закрыт' }}
+          </span>
+          <span class="pill accent" v-if="list.scheduled_today">сегодня</span>
+        </div>
+        <p class="sub" v-if="list.description">{{ list.description }}</p>
+        <p class="small muted">
+          Расписание: {{ list.schedule_text }} · мест в очереди: {{ list.places }} ·
+          участников: {{ list.members_total }}
+        </p>
+
+        <div :class="['banner', list.window.state]">
+          {{ list.window.hint }}
+          <span v-if="list.window.state === 'closed' && countdown">
+            До открытия: <b>{{ countdown }}</b>
           </span>
         </div>
 
-        <password-card :is-default="state.data.password_is_default"
-                       @changed="load"></password-card>
-
-        <div class="card">
-          <h2>Мои пожелания на {{ state.data.day }}</h2>
-          <p class="sub">
-            Выберите три разных места очереди (1 — сдавать первым,
-            {{ state.data.places }} — последним). Пока приём открыт, выбор можно менять.
-          </p>
-
-          <div class="row">
-            <div>
-              <label>Первое желание</label>
-              <select v-model.number="picks.p1" :disabled="!state.data.can_edit">
-                <option :value="null">— не выбрано —</option>
-                <option v-for="p in placeList" :key="'a'+p" :value="p">Место {{ p }}</option>
-              </select>
-            </div>
-            <div>
-              <label>Второе желание</label>
-              <select v-model.number="picks.p2" :disabled="!state.data.can_edit">
-                <option :value="null">— не выбрано —</option>
-                <option v-for="p in placeList" :key="'b'+p" :value="p">Место {{ p }}</option>
-              </select>
-            </div>
-            <div>
-              <label>Третье желание</label>
-              <select v-model.number="picks.p3" :disabled="!state.data.can_edit">
-                <option :value="null">— не выбрано —</option>
-                <option v-for="p in placeList" :key="'c'+p" :value="p">Место {{ p }}</option>
-              </select>
-            </div>
+        <div class="row">
+          <div>
+            <label>Первое желание</label>
+            <select v-model.number="picks.p1" :disabled="!list.can_edit"
+                    @change="dirty = true">
+              <option :value="null">— не выбрано —</option>
+              <option v-for="p in placeList" :key="'a'+p" :value="p">Место {{ p }}</option>
+            </select>
           </div>
-
-          <div class="row tight" style="margin-top:16px">
-            <button @click="savePrefs" :disabled="busy || !state.data.can_edit">
-              {{ state.data.pref ? 'Сохранить изменения' : 'Зафиксировать пожелания' }}
-            </button>
-            <button class="danger" @click="dropPrefs"
-                    :disabled="busy || !state.data.can_edit || !state.data.pref">
-              Удалить пожелания
-            </button>
+          <div>
+            <label>Второе желание</label>
+            <select v-model.number="picks.p2" :disabled="!list.can_edit"
+                    @change="dirty = true">
+              <option :value="null">— не выбрано —</option>
+              <option v-for="p in placeList" :key="'b'+p" :value="p">Место {{ p }}</option>
+            </select>
           </div>
-
-          <p class="small muted" style="margin-top:12px" v-if="state.data.pref">
-            Зафиксировано: <b>{{ state.data.pref.p1 }}, {{ state.data.pref.p2 }},
-            {{ state.data.pref.p3 }}</b> (обновлено {{ state.data.pref.updated_at }})
-          </p>
-          <p class="small muted" style="margin-top:12px" v-else>
-            Пожелания пока не зафиксированы. Если не успеть до
-            {{ window.open_to }}, место будет назначено случайно.
-          </p>
-          <p class="small muted" v-if="!state.data.can_edit">
-            Сейчас приём пожеланий закрыт, поля недоступны для изменения.
-            <template v-if="window.countdown">
-              Откроется через <b>{{ window.countdown }}</b>.
-            </template>
-          </p>
+          <div>
+            <label>Третье желание</label>
+            <select v-model.number="picks.p3" :disabled="!list.can_edit"
+                    @change="dirty = true">
+              <option :value="null">— не выбрано —</option>
+              <option v-for="p in placeList" :key="'c'+p" :value="p">Место {{ p }}</option>
+            </select>
+          </div>
         </div>
 
-        <div class="card" v-if="state.data.my_result">
-          <h2>Моё место в очереди</h2>
-          <p class="sub">Распределение за {{ state.data.report_day }}</p>
+        <div class="row tight" style="margin-top:14px">
+          <button @click="save" :disabled="busy || !list.can_edit">
+            {{ list.pref ? 'Сохранить изменения' : 'Зафиксировать пожелания' }}
+          </button>
+          <button class="danger" @click="drop"
+                  :disabled="busy || !list.can_edit || !list.pref">
+            Удалить пожелания
+          </button>
+        </div>
+
+        <p class="small muted" style="margin-top:10px" v-if="list.pref">
+          Зафиксировано: <b>{{ list.pref.p1 }}, {{ list.pref.p2 }}, {{ list.pref.p3 }}</b>
+          (обновлено {{ list.pref.updated_at }})
+        </p>
+        <p class="small muted" style="margin-top:10px" v-else>
+          Пожелания не зафиксированы. Если не успеть до {{ list.open_to }},
+          место будет назначено случайно.
+        </p>
+
+        <!-- кто уже проголосовал -->
+        <h3 @click="showWho = !showWho" class="clickable">
+          Проголосовали: {{ list.voted.length }} из {{ list.members_total }}
+          <span class="small">{{ showWho ? '▲ скрыть' : '▼ показать' }}</span>
+        </h3>
+        <div class="row" v-if="showWho">
+          <div>
+            <div class="small muted">Отдали пожелания ({{ list.voted.length }})</div>
+            <ul class="names">
+              <li v-for="p in list.voted" :key="'v'+p.full_name"
+                  :class="{me: p.is_me}">{{ p.full_name }}</li>
+              <li v-if="!list.voted.length" class="muted">пока никто</li>
+            </ul>
+          </div>
+          <div>
+            <div class="small muted">Ещё не голосовали ({{ list.not_voted.length }})</div>
+            <ul class="names">
+              <li v-for="p in list.not_voted" :key="'n'+p.full_name"
+                  :class="{me: p.is_me}">{{ p.full_name }}</li>
+              <li v-if="!list.not_voted.length" class="muted">все проголосовали</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- результат -->
+        <template v-if="list.my_result">
+          <h3>Моё место</h3>
           <div class="result-line">
-            <span class="place-badge">{{ state.data.my_result.place }}</span>
+            <span class="place-badge">{{ list.my_result.place }}</span>
             <span>
-              <span class="pill" :class="state.data.my_result.status === 'satisfied' ? 'ok' : 'warn'">
-                {{ state.data.my_result.status_text }}
+              <span class="pill" :class="list.my_result.status === 'satisfied' ? 'ok' : 'warn'">
+                {{ list.my_result.status_text }}
               </span>
-              <span class="pill accent" v-if="state.data.my_result.swapped"
+              <span class="pill accent" v-if="list.my_result.swapped"
                     style="margin-left:6px">получено обменом</span>
-              <div class="small muted" v-if="state.data.my_result.wishes">
-                Ваши пожелания были: {{ state.data.my_result.wishes }}
-                <template v-if="state.data.my_result.rank">
-                  · сработало пожелание №{{ state.data.my_result.rank }}
+              <div class="small muted" v-if="list.my_result.wishes">
+                Ваши пожелания: {{ list.my_result.wishes }}
+                <template v-if="list.my_result.rank">
+                  · сработало пожелание №{{ list.my_result.rank }}
                 </template>
               </div>
+              <div class="small muted">Распределение за {{ list.report_day }}</div>
             </span>
           </div>
 
@@ -398,7 +414,7 @@
               <label>С кем меняемся</label>
               <select v-model.number="swapTarget">
                 <option :value="null">— выберите участника —</option>
-                <option v-for="c in state.data.candidates" :key="c.user_id" :value="c.user_id">
+                <option v-for="c in list.candidates" :key="c.user_id" :value="c.user_id">
                   Место {{ c.place }} — {{ c.full_name }}
                 </option>
               </select>
@@ -408,18 +424,16 @@
             </div>
           </div>
 
-          <h3 v-if="incoming.length">Вам предлагают обмен</h3>
           <div class="swap-item" v-for="s in incoming" :key="s.id">
             <div class="grow">
-              <b>{{ s.from_name }}</b> предлагает поменяться:
-              вы отдаёте место <b>{{ s.to_place }}</b>, получаете <b>{{ s.from_place }}</b>.
+              <b>{{ s.from_name }}</b> предлагает поменяться: вы отдаёте место
+              <b>{{ s.to_place }}</b>, получаете <b>{{ s.from_place }}</b>.
               <div class="small muted">Заявка №{{ s.id }} от {{ s.created_at }}</div>
             </div>
             <button class="small" @click="respond(s, 'accept')" :disabled="busy">Согласиться</button>
             <button class="small danger" @click="respond(s, 'decline')" :disabled="busy">Отказать</button>
           </div>
 
-          <h3 v-if="outgoing.length">Ваши предложения</h3>
           <div class="swap-item" v-for="s in outgoing" :key="s.id">
             <div class="grow">
               Ждём ответа от <b>{{ s.to_name }}</b>
@@ -428,33 +442,284 @@
             </div>
             <button class="small danger" @click="respond(s, 'cancel')" :disabled="busy">Отозвать</button>
           </div>
+        </template>
 
-          <h3 v-if="history.length">История обменов</h3>
-          <div class="scroll-x" v-if="history.length">
+        <!-- очередь целиком -->
+        <template v-if="list.queue.length">
+          <h3 @click="showQueue = !showQueue" class="clickable">
+            Очередь за {{ list.report_day }}
+            <span class="small">{{ showQueue ? '▲ скрыть' : '▼ показать' }}</span>
+          </h3>
+          <div class="scroll-x" v-if="showQueue">
             <table>
               <thead>
-                <tr><th>№</th><th>Кто</th><th>Кому</th><th>Места</th><th>Результат</th></tr>
+                <tr><th>Место</th><th>Участник</th><th>Как получено место</th></tr>
               </thead>
               <tbody>
-                <tr v-for="s in history" :key="s.id">
-                  <td>{{ s.id }}</td>
-                  <td>{{ s.from_name }}</td>
-                  <td>{{ s.to_name }}</td>
-                  <td>{{ s.from_place }} ↔ {{ s.to_place }}</td>
-                  <td><span class="pill" :class="s.status === 'accepted' ? 'ok' : 'muted'">
-                    {{ s.status_text }}</span></td>
+                <tr v-for="q in list.queue" :key="q.place" :class="{me: q.is_me}">
+                  <td><b>{{ q.place }}</b></td>
+                  <td>{{ q.full_name }}<span class="pill accent" v-if="q.is_me"
+                      style="margin-left:6px">вы</span></td>
+                  <td>
+                    <span class="pill" :class="q.status === 'satisfied' ? 'ok' :
+                          (q.status === 'missed' ? 'warn' : 'muted')">
+                      {{ q.voted ? 'голосовал' : 'не голосовал' }} — {{ q.status_text }}
+                    </span>
+                    <span class="pill accent" v-if="q.swapped" style="margin-left:6px">обмен</span>
+                  </td>
                 </tr>
               </tbody>
             </table>
           </div>
+        </template>
+        <p class="small muted" v-else-if="!list.my_result">
+          Распределение ещё не сформировано. После расчёта здесь появится вся очередь.
+        </p>
+      </div>
+    `,
+  };
+
+  /* ------------------------------------------------------- страница участника */
+
+  const UserView = {
+    setup() {
+      const state = reactive({ data: null, loading: true });
+
+      const todayLists = computed(function () {
+        if (!state.data) return [];
+        return state.data.lists.filter(function (l) { return l.scheduled_today; });
+      });
+      const otherLists = computed(function () {
+        if (!state.data) return [];
+        return state.data.lists.filter(function (l) { return !l.scheduled_today; });
+      });
+
+      async function load() {
+        try {
+          state.data = await api("/api/user/state");
+        } catch (e) {
+          notify(e.message, "error");
+        } finally {
+          state.loading = false;
+        }
+      }
+
+      let timer = null;
+      onMounted(function () {
+        load();
+        timer = setInterval(load, 20000);   // подтягиваем чужие голоса и заявки
+      });
+      onUnmounted(function () { if (timer) clearInterval(timer); });
+
+      return { state, todayLists, otherLists, load };
+    },
+    components: { PasswordCard, ListCard },
+    template: `
+      <div v-if="state.loading" class="card">Загружаем данные…</div>
+      <div v-else-if="state.data">
+        <password-card :is-default="state.data.password_is_default"
+                       @changed="load"></password-card>
+
+        <div class="card" v-if="!state.data.lists.length">
+          <h2>Листов пока нет</h2>
+          <p class="sub" style="margin:0">
+            Администратор ещё не включил вас ни в один лист голосования.
+          </p>
         </div>
 
-        <div class="card" v-else>
-          <h2>Моё место в очереди</h2>
-          <p class="sub" style="margin:0">
-            Распределение ещё не сформировано. Как только администратор его посчитает,
-            здесь появится ваше место и станет доступен обмен местами.
-          </p>
+        <template v-if="todayLists.length">
+          <h2 class="section">Сегодня, {{ state.data.day }}</h2>
+          <list-card v-for="l in todayLists" :key="l.id" :list="l"
+                     @changed="load"></list-card>
+        </template>
+
+        <template v-if="otherLists.length">
+          <h2 class="section">Другие мои листы</h2>
+          <list-card v-for="l in otherLists" :key="l.id" :list="l"
+                     @changed="load"></list-card>
+        </template>
+      </div>
+    `,
+  };
+
+  /* ------------------------------------------------------- листы: редактор */
+
+  const emptyForm = function () {
+    return { id: null, name: "", description: "", weekdays: "1234567",
+             open_from: "20:00", open_to: "21:00", places: 0, active: true,
+             member_ids: [] };
+  };
+
+  const ListsTab = {
+    props: ["data"],
+    emits: ["changed"],
+    setup(props, ctx) {
+      const form = reactive(emptyForm());
+      const editing = ref(false);
+      const busy = ref(false);
+
+      function startNew() {
+        Object.assign(form, emptyForm());
+        editing.value = true;
+      }
+
+      function startEdit(list) {
+        Object.assign(form, {
+          id: list.id, name: list.name, description: list.description,
+          weekdays: list.weekdays, open_from: list.open_from, open_to: list.open_to,
+          places: list.places_setting, active: list.active,
+          member_ids: list.member_ids.slice(),
+        });
+        editing.value = true;
+      }
+
+      function toggleDay(index) {
+        const digit = String(index + 1);
+        form.weekdays = form.weekdays.includes(digit)
+          ? form.weekdays.split(digit).join("")
+          : (form.weekdays + digit).split("").sort().join("");
+      }
+
+      function toggleMember(id) {
+        const idx = form.member_ids.indexOf(id);
+        if (idx >= 0) form.member_ids.splice(idx, 1);
+        else form.member_ids.push(id);
+      }
+
+      function allMembers() {
+        form.member_ids = props.data.users.map(function (u) { return u.id; });
+      }
+
+      function noMembers() { form.member_ids = []; }
+
+      async function save() {
+        busy.value = true;
+        try {
+          const url = form.id ? "/api/admin/lists/" + form.id : "/api/admin/lists";
+          const data = await api(url, { method: "POST", body: { ...form } });
+          notify(data.message, "ok");
+          editing.value = false;
+          ctx.emit("changed");
+        } catch (e) {
+          notify(e.message, "error");
+        } finally {
+          busy.value = false;
+        }
+      }
+
+      async function remove(list) {
+        if (!confirm("Удалить лист «" + list.name +
+                     "» вместе со всеми его пожеланиями и распределениями?")) return;
+        busy.value = true;
+        try {
+          const data = await api("/api/admin/lists/" + list.id + "/delete",
+                                 { method: "POST" });
+          notify(data.message, "ok");
+          ctx.emit("changed");
+        } catch (e) {
+          notify(e.message, "error");
+        } finally {
+          busy.value = false;
+        }
+      }
+
+      return { form, editing, busy, WEEKDAYS, startNew, startEdit, toggleDay,
+               toggleMember, allMembers, noMembers, save, remove };
+    },
+    template: `
+      <div class="card">
+        <h2>Листы голосования</h2>
+        <p class="sub">
+          Лист — это отдельное голосование: своё название, описание, состав людей,
+          дни недели и время приёма пожеланий. Приём открывается автоматически,
+          а за {{ data.reset_lead }} минут до открытия старые пожелания стираются.
+        </p>
+        <button @click="startNew" :disabled="busy">Создать лист</button>
+
+        <div class="scroll-x" style="margin-top:14px" v-if="data.lists.length">
+          <table>
+            <thead>
+              <tr><th>Название</th><th>Расписание</th><th>Участники</th>
+                  <th>Мест</th><th>Состояние</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="l in data.lists" :key="l.id">
+                <td>
+                  <b>{{ l.name }}</b>
+                  <div class="small muted" v-if="l.description">{{ l.description }}</div>
+                </td>
+                <td class="small">{{ l.schedule_text }}</td>
+                <td>{{ l.members_total }}</td>
+                <td>{{ l.places }}</td>
+                <td>
+                  <span class="pill" :class="l.window.state === 'open' ? 'ok' : 'muted'">
+                    {{ l.window.state === 'open' ? 'приём открыт' : 'приём закрыт' }}
+                  </span>
+                  <span class="pill warn" v-if="!l.active" style="margin-left:6px">выключен</span>
+                </td>
+                <td>
+                  <button class="small ghost" @click="startEdit(l)" :disabled="busy">Изменить</button>
+                  <button class="small danger" @click="remove(l)" :disabled="busy"
+                          style="margin-left:6px">Удалить</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="sub" v-else style="margin-top:12px">Пока не создано ни одного листа.</p>
+      </div>
+
+      <div class="card" v-if="editing">
+        <h2>{{ form.id ? 'Изменение листа' : 'Новый лист' }}</h2>
+        <div class="row">
+          <div style="flex:2 1 260px">
+            <label>Название</label>
+            <input v-model="form.name" placeholder="Лабораторная работа №2">
+          </div>
+          <div style="flex:0 0 140px">
+            <label>Начало приёма</label>
+            <input type="time" v-model="form.open_from">
+          </div>
+          <div style="flex:0 0 140px">
+            <label>Конец приёма</label>
+            <input type="time" v-model="form.open_to">
+          </div>
+          <div style="flex:0 0 160px">
+            <label>Мест (0 — по числу людей)</label>
+            <input type="number" min="0" v-model.number="form.places">
+          </div>
+        </div>
+
+        <label>Описание (видят участники)</label>
+        <input v-model="form.description" placeholder="Кратко: что сдаём и где">
+
+        <label>Дни повторения</label>
+        <div class="row tight">
+          <button v-for="(day, i) in WEEKDAYS" :key="day" type="button"
+                  :class="['small', form.weekdays.includes(String(i+1)) ? '' : 'ghost']"
+                  @click="toggleDay(i)">{{ day }}</button>
+        </div>
+
+        <label style="margin-top:14px">
+          <input type="checkbox" v-model="form.active" style="width:auto"> Лист включён
+        </label>
+
+        <h3>Участники листа ({{ form.member_ids.length }})</h3>
+        <div class="row tight" style="margin-bottom:8px">
+          <button class="small ghost" type="button" @click="allMembers">Выбрать всех</button>
+          <button class="small ghost" type="button" @click="noMembers">Снять всех</button>
+        </div>
+        <div class="members">
+          <label v-for="u in data.users" :key="u.id" class="member">
+            <input type="checkbox" :checked="form.member_ids.includes(u.id)"
+                   @change="toggleMember(u.id)" style="width:auto">
+            {{ u.full_name }}
+          </label>
+        </div>
+
+        <div class="row tight" style="margin-top:16px">
+          <button @click="save" :disabled="busy">Сохранить лист</button>
+          <button class="ghost" @click="editing = false" :disabled="busy">Отмена</button>
         </div>
       </div>
     `,
@@ -463,10 +728,11 @@
   /* --------------------------------------------------- раздел администратора */
 
   const AdminView = {
-    props: ["user", "window"],
+    props: ["user"],
     setup(props) {
-      const tab = ref("overview");
+      const tab = ref("lists");
       const day = ref(new Date().toISOString().slice(0, 10));
+      const listsData = ref(null);
       const overview = ref(null);
       const report = ref(null);
       const logs = ref(null);
@@ -475,20 +741,36 @@
       const manualPw = reactive({});
       const logFrom = ref("");
       const logTo = ref(day.value);
-      const settings = reactive({ places_count: "", test_mode: false });
+      const currentList = ref(null);
+      const reportList = ref(null);
+      const testMode = ref(false);
 
-      async function loadOverview() {
+      async function loadLists() {
         try {
-          overview.value = await api("/api/admin/overview?day=" + day.value);
-          settings.places_count = overview.value.places;
-          settings.test_mode = overview.value.test_mode;
+          listsData.value = await api("/api/admin/lists?day=" + day.value);
+          testMode.value = listsData.value.test_mode;
+          if (!currentList.value && listsData.value.lists.length) {
+            currentList.value = listsData.value.lists[0].id;
+            reportList.value = currentList.value;
+          }
         } catch (e) { notify(e.message, "error"); }
       }
 
-      async function loadReport(target) {
-        if (target) day.value = target;
+      async function loadOverview() {
         try {
-          report.value = await api("/api/admin/report?day=" + day.value);
+          let url = "/api/admin/overview?day=" + day.value;
+          if (currentList.value) url += "&list_id=" + currentList.value;
+          overview.value = await api(url);
+          if (overview.value.list) currentList.value = overview.value.list.id;
+        } catch (e) { notify(e.message, "error"); }
+      }
+
+      async function loadReport(targetDay) {
+        if (targetDay) day.value = targetDay;
+        if (!reportList.value) { report.value = null; return; }
+        try {
+          report.value = await api("/api/admin/report?list_id=" + reportList.value +
+                                   "&day=" + day.value);
         } catch (e) {
           report.value = null;
           notify(e.message, "error");
@@ -506,19 +788,23 @@
 
       function openTab(name) {
         tab.value = name;
-        if (name === "overview" || name === "users") loadOverview();
-        if (name === "report") loadReport();
+        if (name === "lists" || name === "users") loadLists();
+        if (name === "overview") { loadLists(); loadOverview(); }
+        if (name === "report") { loadLists(); loadReport(); }
         if (name === "logs") loadLogs();
       }
 
       async function compute() {
+        if (!currentList.value) { notify("Выберите лист.", "error"); return; }
         if (!confirm("Сформировать распределение за " + day.value + "?")) return;
         busy.value = true;
         try {
           const data = await api("/api/admin/compute", {
-            method: "POST", body: { day: day.value },
+            method: "POST", body: { list_id: currentList.value, day: day.value },
           });
           notify(data.message + " " + data.summary, "ok");
+          reportList.value = data.list_id;
+          await loadLists();
           await loadOverview();
           await loadReport(data.day);
           tab.value = "report";
@@ -526,12 +812,16 @@
         finally { busy.value = false; }
       }
 
-      async function resetNow() {
-        if (!confirm("Стереть все пожелания и подготовить сайт к новому расчёту?")) return;
+      async function resetNow(listId) {
+        if (!confirm(listId ? "Стереть пожелания этого листа?"
+                            : "Стереть пожелания во всех листах?")) return;
         busy.value = true;
         try {
-          const data = await api("/api/admin/reset", { method: "POST" });
+          const data = await api("/api/admin/reset", {
+            method: "POST", body: listId ? { list_id: listId } : {},
+          });
           notify(data.message, "ok");
+          await loadLists();
           await loadOverview();
         } catch (e) { notify(e.message, "error"); }
         finally { busy.value = false; }
@@ -541,13 +831,46 @@
         busy.value = true;
         try {
           const data = await api("/api/admin/settings", {
-            method: "POST",
-            body: { places_count: settings.places_count, test_mode: settings.test_mode },
+            method: "POST", body: { test_mode: testMode.value },
           });
           notify(data.message, "ok");
-          await loadOverview();
+          await loadLists();
         } catch (e) { notify(e.message, "error"); }
         finally { busy.value = false; }
+      }
+
+      const importFile = ref(null);
+      const importList = ref(null);
+      const importDay = ref("");
+      const importResult = ref(null);
+
+      function pickFile(event) {
+        importFile.value = event.target.files[0] || null;
+        importResult.value = null;
+      }
+
+      async function uploadReport() {
+        if (!importFile.value) { notify("Выберите файл отчёта.", "error"); return; }
+        busy.value = true;
+        try {
+          const form = new FormData();
+          form.append("file", importFile.value);
+          if (importList.value) form.append("list_id", importList.value);
+          if (importDay.value) form.append("day", importDay.value);
+          const response = await fetch("/api/admin/import", { method: "POST", body: form });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || "Ошибка загрузки");
+          notify(data.message, "ok");
+          importResult.value = data;
+          reportList.value = data.list_id;
+          day.value = data.day;
+          await loadLists();
+          await loadReport(data.day);
+        } catch (e) {
+          notify(e.message, "error");
+        } finally {
+          busy.value = false;
+        }
       }
 
       async function changePassword(person, mode) {
@@ -563,15 +886,18 @@
         finally { busy.value = false; }
       }
 
-      onMounted(loadOverview);
+      onMounted(loadLists);
 
-      return { tab, day, overview, report, logs, busy, newPassword, manualPw,
-               settings, logFrom, logTo, openTab, compute, resetNow, saveSettings,
-               changePassword, loadOverview, loadReport, loadLogs };
+      return { tab, day, listsData, overview, report, logs, busy, newPassword,
+               manualPw, logFrom, logTo, currentList, reportList, testMode,
+               importFile, importList, importDay, importResult, pickFile,
+               uploadReport, openTab, compute, resetNow, saveSettings,
+               changePassword, loadLists, loadOverview, loadReport, loadLogs };
     },
-    components: { UserView },
+    components: { UserView, ListsTab },
     template: `
       <div class="tabs">
+        <button :class="{active: tab === 'lists'}" @click="openTab('lists')">Листы</button>
         <button :class="{active: tab === 'overview'}" @click="openTab('overview')">Обзор дня</button>
         <button :class="{active: tab === 'mine'}" @click="openTab('mine')">Мои пожелания</button>
         <button :class="{active: tab === 'users'}" @click="openTab('users')">Пользователи и пароли</button>
@@ -579,17 +905,42 @@
         <button :class="{active: tab === 'logs'}" @click="openTab('logs')">Журнал</button>
       </div>
 
-      <!-- ------------------------------------- мои пожелания (админ тоже участник) -->
-      <template v-if="tab === 'mine'">
-        <user-view :user="user" :window="window"></user-view>
+      <!-- --------------------------------------------------------- листы -->
+      <template v-if="tab === 'lists' && listsData">
+        <lists-tab :data="listsData" @changed="loadLists"></lists-tab>
+
+        <div class="card">
+          <h2>Общие настройки</h2>
+          <div class="row">
+            <div>
+              <label>
+                <input type="checkbox" v-model="testMode" style="width:auto">
+                Режим отладки: приём пожеланий открыт круглосуточно во всех листах
+              </label>
+            </div>
+            <div style="flex:0 0 auto">
+              <button @click="saveSettings" :disabled="busy">Сохранить</button>
+            </div>
+            <div style="flex:0 0 auto">
+              <button class="ghost" @click="resetNow(null)" :disabled="busy">
+                Стереть пожелания во всех листах
+              </button>
+            </div>
+          </div>
+        </div>
       </template>
 
       <!-- ------------------------------------------------------- обзор дня -->
       <template v-if="tab === 'overview' && overview">
         <div class="card">
-          <h2>Состояние на {{ overview.day }}</h2>
-          <p class="sub">{{ overview.window.hint }}</p>
+          <h2>Обзор дня</h2>
           <div class="row">
+            <div>
+              <label>Лист</label>
+              <select v-model.number="currentList" @change="loadOverview">
+                <option v-for="l in overview.lists" :key="l.id" :value="l.id">{{ l.name }}</option>
+              </select>
+            </div>
             <div>
               <label>Дата расчёта</label>
               <input type="date" v-model="day" @change="loadOverview">
@@ -598,43 +949,27 @@
               <button @click="compute" :disabled="busy">Сформировать распределение</button>
             </div>
             <div style="flex:0 0 auto">
-              <button class="ghost" @click="resetNow" :disabled="busy">
-                Подготовить к новому дню
+              <button class="ghost" @click="resetNow(currentList)" :disabled="busy">
+                Подготовить лист заново
               </button>
             </div>
           </div>
-          <p class="small muted" style="margin-top:10px">
-            Пожелания прислали: <b>{{ overview.submitted }}</b> из {{ overview.people.length }}.
-            Мест: {{ overview.places }}.
-            Последняя автоподготовка: {{ overview.last_reset || 'ещё не выполнялась' }}
-            (ежедневно в {{ overview.window.reset_at }}).
-          </p>
-          <p class="small" v-if="overview.meta">
-            <span class="pill ok">отчёт сформирован {{ overview.meta.created_at }}</span>
-            {{ overview.meta.summary }}
-          </p>
+
+          <template v-if="overview.list">
+            <p class="small muted" style="margin-top:10px">
+              {{ overview.list.schedule_text }} · мест: {{ overview.list.places }} ·
+              пожелания прислали: <b>{{ overview.submitted }}</b> из
+              {{ overview.list.members_total }} ·
+              последняя подготовка: {{ overview.list.last_reset || 'ещё не выполнялась' }}
+            </p>
+            <p class="small" v-if="overview.list.meta">
+              <span class="pill ok">отчёт сформирован {{ overview.list.meta.created_at }}</span>
+              {{ overview.list.meta.summary }}
+            </p>
+          </template>
         </div>
 
-        <div class="card">
-          <h2>Настройки</h2>
-          <div class="row">
-            <div>
-              <label>Количество мест в очереди</label>
-              <input type="number" v-model="settings.places_count" min="1">
-            </div>
-            <div>
-              <label>
-                <input type="checkbox" v-model="settings.test_mode" style="width:auto">
-                Режим отладки: сайт открыт круглосуточно
-              </label>
-            </div>
-            <div style="flex:0 0 auto">
-              <button @click="saveSettings" :disabled="busy">Сохранить</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
+        <div class="card" v-if="overview.list">
           <h2>Кто прислал пожелания</h2>
           <div class="scroll-x">
             <table>
@@ -655,8 +990,13 @@
         </div>
       </template>
 
+      <!-- ------------------------------------- мои пожелания (админ — участник) -->
+      <template v-if="tab === 'mine'">
+        <user-view></user-view>
+      </template>
+
       <!-- ------------------------------------------------------ пользователи -->
-      <template v-if="tab === 'users' && overview">
+      <template v-if="tab === 'users' && listsData">
         <div class="card">
           <h2>Пользователи и пароли</h2>
           <p class="sub">
@@ -673,7 +1013,7 @@
               <thead><tr><th>Участник</th><th style="width:260px">Задать вручную</th>
                 <th style="width:230px">Действие</th></tr></thead>
               <tbody>
-                <tr v-for="p in overview.people" :key="p.id">
+                <tr v-for="p in listsData.users" :key="p.id">
                   <td>{{ p.full_name }}
                     <span class="pill accent" v-if="p.is_admin">админ</span></td>
                   <td><input v-model="manualPw[p.id]" maxlength="7" placeholder="например ab12cd7"></td>
@@ -693,8 +1033,50 @@
       <!-- ------------------------------------------------------------ отчёт -->
       <template v-if="tab === 'report'">
         <div class="card">
+          <h2>Загрузить готовое распределение из файла</h2>
+          <p class="sub">
+            Сюда можно вернуть ранее скачанный отчёт (<b>Очередь_…csv</b>) — например,
+            если хостинг перезапустился и данные пропали, или если очередь поправили
+            в Excel. Лист и дата берутся из самого файла; если листа с таким названием
+            нет или дата не указана, выберите их вручную.
+          </p>
+          <div class="row">
+            <div>
+              <label>Файл отчёта (CSV)</label>
+              <input type="file" accept=".csv,text/csv" @change="pickFile">
+            </div>
+            <div v-if="listsData">
+              <label>Лист (по умолчанию — из файла)</label>
+              <select v-model="importList">
+                <option :value="null">— определить по названию в файле —</option>
+                <option v-for="l in listsData.lists" :key="l.id" :value="l.id">{{ l.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label>Дата (по умолчанию — из файла)</label>
+              <input type="date" v-model="importDay">
+            </div>
+            <div style="flex:0 0 auto">
+              <button @click="uploadReport" :disabled="busy || !importFile">
+                Загрузить отчёт
+              </button>
+            </div>
+          </div>
+          <div class="banner open" v-if="importResult" style="margin-top:14px">
+            Загружено строк: <b>{{ importResult.imported }}</b> за {{ importResult.day }}.
+            <div class="small" v-for="w in importResult.warnings" :key="w">⚠ {{ w }}</div>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>Отчёт о распределении</h2>
           <div class="row">
+            <div v-if="listsData">
+              <label>Лист</label>
+              <select v-model.number="reportList" @change="loadReport()">
+                <option v-for="l in listsData.lists" :key="l.id" :value="l.id">{{ l.name }}</option>
+              </select>
+            </div>
             <div>
               <label>Дата</label>
               <input type="date" v-model="day">
@@ -702,25 +1084,23 @@
             <div style="flex:0 0 auto">
               <button class="ghost" @click="loadReport()">Показать</button>
             </div>
-            <div v-if="overview && overview.report_days.length">
-              <label>Готовые отчёты</label>
-              <select @change="loadReport($event.target.value)">
-                <option value="">— выбрать дату —</option>
-                <option v-for="d in overview.report_days" :key="d" :value="d">{{ d }}</option>
-              </select>
-            </div>
           </div>
 
           <template v-if="report">
-            <p class="small" style="margin-top:12px" v-if="report.meta">
-              Сформирован: <b>{{ report.meta.created_at }}</b>,
-              администратор: {{ report.meta.created_by }}<br>
-              {{ report.meta.summary }}
+            <p class="small" style="margin-top:12px">
+              <b>{{ report.list.name }}</b> — {{ report.list.schedule_text }}<br>
+              <template v-if="report.meta">
+                Сформирован: <b>{{ report.meta.created_at }}</b>,
+                администратор: {{ report.meta.created_by }}<br>
+                {{ report.meta.summary }}
+              </template>
             </p>
             <div class="dl-links">
-              <a :href="'/download/report/' + report.day + '.csv'">Скачать таблицу (CSV)</a>
+              <a :href="'/download/report/' + report.list.id + '/' + report.day + '.csv'">
+                Скачать таблицу (CSV)</a>
               <a :href="'/download/log/' + report.day + '.log'">Скачать журнал (LOG)</a>
-              <a :href="'/download/report/' + report.day + '.zip'">Скачать всё архивом (ZIP)</a>
+              <a :href="'/download/report/' + report.list.id + '/' + report.day + '.zip'">
+                Скачать всё архивом (ZIP)</a>
             </div>
 
             <div class="scroll-x" style="margin-top:16px">
@@ -747,7 +1127,7 @@
               </table>
             </div>
 
-            <h3 v-if="report.swaps.length">Заявки на обмен за этот день</h3>
+            <h3 v-if="report.swaps.length">Заявки на обмен</h3>
             <div class="scroll-x" v-if="report.swaps.length">
               <table>
                 <thead><tr><th>№</th><th>От кого</th><th>Кому</th><th>Места</th>
@@ -764,11 +1144,13 @@
               </table>
             </div>
 
-            <h3>Журнал расчёта</h3>
+            <h3>Журнал за этот день</h3>
             <div class="logbox">{{ report.events.map(e => e.ts + ' | ' + e.actor + ' | ' +
               e.action + ' | ' + e.message).join('\\n') }}</div>
           </template>
-          <p class="sub" v-else style="margin-top:12px">Отчёт за выбранную дату не найден.</p>
+          <p class="sub" v-else style="margin-top:12px">
+            Отчёт за выбранные лист и дату не найден.
+          </p>
         </div>
       </template>
 
@@ -796,15 +1178,12 @@
 
   const App = {
     setup() {
-      const session = reactive({ user: null, window: { state: "closed", hint: "", countdown: "" },
-                                 loaded: false, server_time: "" });
+      const session = reactive({ user: null, loaded: false, server_time: "" });
 
       async function refresh() {
         try {
           const data = await api("/api/session");
           session.user = data.user;
-          session.window = Object.assign({ countdown: "" }, data.window);
-          session.window.countdown = fmtCountdown(data.window.seconds_to_open);
           session.server_time = data.server_time;
         } catch (e) {
           notify(e.message, "error");
@@ -825,19 +1204,7 @@
         refresh();
       }
 
-      let tick = null;
-      onMounted(function () {
-        refresh();
-        tick = setInterval(function () {
-          if (session.window.seconds_to_open > 0) {
-            session.window.seconds_to_open -= 1;
-            session.window.countdown = fmtCountdown(session.window.seconds_to_open);
-            if (session.window.seconds_to_open <= 0) refresh();
-          }
-        }, 1000);
-      });
-      onUnmounted(function () { if (tick) clearInterval(tick); });
-
+      onMounted(refresh);
       return { session, toasts, onLoggedIn, logout };
     },
     components: { LoginView, UserView, AdminView },
@@ -854,10 +1221,9 @@
       </header>
 
       <div class="wrap" v-if="session.loaded">
-        <login-view v-if="!session.user" :window="session.window" @logged-in="onLoggedIn"></login-view>
-        <admin-view v-else-if="session.user.is_admin" :user="session.user"
-                    :window="session.window"></admin-view>
-        <user-view v-else :user="session.user" :window="session.window"></user-view>
+        <login-view v-if="!session.user" @logged-in="onLoggedIn"></login-view>
+        <admin-view v-else-if="session.user.is_admin" :user="session.user"></admin-view>
+        <user-view v-else></user-view>
       </div>
 
       <div class="toast-area">

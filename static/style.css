@@ -138,3 +138,23 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 .pw-box code { font-size: 18px; font-weight: 700; letter-spacing: .08em; }
 a { color: var(--accent); }
 .dl-links { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+
+/* ---------------------------------------------- листы голосования */
+h2.section {
+  font-size: 14px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin: 22px 0 10px;
+}
+.list-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.list-head h2 { margin: 0; }
+h3.clickable { cursor: pointer; user-select: none; }
+h3.clickable:hover { color: var(--accent); }
+ul.names { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; columns: 2; }
+ul.names li { padding: 2px 0; break-inside: avoid; }
+ul.names li.me { color: var(--accent); font-weight: 600; }
+tr.me td { background: var(--accent-soft); }
+.members {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 4px 12px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px; max-height: 320px; overflow: auto;
+}
+.members .member { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; color: var(--ink); }
