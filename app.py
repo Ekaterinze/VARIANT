@@ -5,8 +5,9 @@ Backend: Flask + SQLite, отдаёт JSON API и один HTML-каркас.
 Frontend: Vue 3 (static/app.js), подключается без сборки.
 
 Правила работы:
-  * обычный пользователь входит только с 20:00 до 21:00;
-  * администратор (Пархачева Екатерина) входит в любое время;
+  * войти на сайт можно в любое время;
+  * пожелания принимаются только с 20:00 до 21:00;
+  * администратор (Пархачева Екатерина) формирует отчёты когда угодно;
   * в 19:55 все пожелания стираются, сайт готов к новому расчёту;
   * после расчёта участники могут предлагать друг другу обмен местами.
 """
@@ -220,12 +221,6 @@ def api_login():
                    "неверная фамилия/имя или пароль", level="WARNING")
             return fail("Неверная фамилия, имя или пароль.", 401)
 
-        state, hint = db.window_state(conn)
-        if state != "open" and not user["is_admin"]:
-            db.log(conn, user["full_name"], "LOGIN_DENIED", hint, level="WARNING")
-            return fail("Сайт открыт с %s до %s. %s" % (
-                db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M"), hint), 403)
-
         session["user_id"] = user["id"]
         db.log(conn, user["full_name"], "LOGIN",
                "вход выполнен%s" % (" (администратор)" if user["is_admin"] else ""))
@@ -382,11 +377,6 @@ def api_change_own_password(conn, user):
 @api_login_required
 def api_create_swap(conn, user):
     data = request.get_json(silent=True) or {}
-    state, _ = db.window_state(conn)
-    if state != "open" and not user["is_admin"]:
-        return fail("Обмен местами доступен только с %s до %s." % (
-            db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M")), 403)
-
     day = db.latest_report_day(conn)
     if not day:
         return fail("Распределение ещё не сформировано — меняться пока нечем.")
@@ -426,11 +416,6 @@ def api_respond_swap(conn, user, swap_id):
     if swap["status"] != "pending":
         return fail("Заявка уже обработана (%s)."
                     % SWAP_STATUS_TEXT.get(swap["status"], swap["status"]))
-
-    state, _ = db.window_state(conn)
-    if state != "open" and not user["is_admin"]:
-        return fail("Обмен местами доступен только с %s до %s." % (
-            db.OPEN_FROM.strftime("%H:%M"), db.OPEN_TO.strftime("%H:%M")), 403)
 
     day = swap["day"]
     author = db.get_user(conn, swap["from_user"])

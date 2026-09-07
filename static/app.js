@@ -83,7 +83,7 @@
           <div :class="['banner', window.state]" v-if="window">
             {{ window.hint }}
             <span v-if="window.state === 'closed' && window.countdown">
-              До открытия: <b>{{ window.countdown }}</b>
+              До открытия приёма: <b>{{ window.countdown }}</b>
             </span>
           </div>
 
@@ -100,8 +100,9 @@
             </div>
           </form>
           <p class="sub small" style="margin-top:16px">
-            Сайт открыт для участников с {{ window.open_from }} до {{ window.open_to }}.
-            Пожелания стираются каждый день в {{ window.reset_at }}.
+            Войти можно в любое время: посмотреть своё место и договориться об обмене.
+            Пожелания принимаются только с {{ window.open_from }} до {{ window.open_to }}
+            и стираются каждый день в {{ window.reset_at }}.
           </p>
         </div>
       </div>
@@ -364,7 +365,10 @@
             {{ window.open_to }}, место будет назначено случайно.
           </p>
           <p class="small muted" v-if="!state.data.can_edit">
-            Сейчас приём закрыт, поля недоступны для изменения.
+            Сейчас приём пожеланий закрыт, поля недоступны для изменения.
+            <template v-if="window.countdown">
+              Откроется через <b>{{ window.countdown }}</b>.
+            </template>
           </p>
         </div>
 

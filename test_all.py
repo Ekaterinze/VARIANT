@@ -150,18 +150,33 @@ def test_login_rules():
 
 
 def test_window_closed():
-    print("\n[6] Вне окна 20:00-21:00 пускают только администратора")
+    print("\n[6] Вне окна 20:00-21:00: вход открыт, пожелания не принимаются")
     original = db.window_state
-    db.window_state = lambda conn, now=None: ("closed", "Тест: окно закрыто.")
+    db.window_state = lambda conn, now=None: ("closed", "Тест: приём пожеланий закрыт.")
     try:
         cli = client()
         r = login(cli, "Иванова Анна")
-        check(r.status_code == 403, "обычному пользователю вход закрыт")
+        check(r.status_code == 200, "обычный пользователь входит в любое время")
+
+        state = cli.get("/api/user/state").get_json()
+        check(state["can_edit"] is False, "поля пожеланий помечены как недоступные")
+
+        r = cli.post("/api/user/prefs", json={"p1": 1, "p2": 2, "p3": 3})
+        check(r.status_code == 403, "новые пожелания вне окна не принимаются")
+        check("20:00" in r.get_json()["error"] and "21:00" in r.get_json()["error"],
+              "в ответе указано время приёма пожеланий")
+
+        r = cli.delete("/api/user/prefs")
+        check(r.status_code == 403, "удалить пожелания вне окна тоже нельзя")
+
         adm = client()
         r = login(adm, "Пархачева Екатерина")
         check(r.status_code == 200, "администратор входит в любое время")
-        r = adm.get("/api/admin/overview")
-        check(r.status_code == 200, "администратор видит отчётный раздел")
+        check(adm.get("/api/admin/overview").status_code == 200,
+              "администратор видит отчётный раздел")
+        check(adm.post("/api/user/prefs",
+                       json={"p1": 1, "p2": 2, "p3": 3}).status_code == 403,
+              "администратору вне окна пожелания тоже не принимаются")
     finally:
         db.window_state = original
 
@@ -290,6 +305,21 @@ def test_swap_flow():
     check(any(x["swapped"] for x in report["rows"]), "в отчёте отмечен факт обмена")
     check(any(s["status"] == "accepted" for s in report["swaps"]),
           "история заявок попала в отчёт")
+
+    original = db.window_state
+    db.window_state = lambda conn, now=None: ("closed", "Тест: приём пожеланий закрыт.")
+    try:
+        r = a.post("/api/user/swaps", json={"to_user_id": b_id})
+        check(r.status_code == 200,
+              "договориться об обмене можно и вне окна приёма пожеланий")
+        pending = [s for s in b.get("/api/user/state").get_json()["swaps"]
+                   if s["status"] == "pending"]
+        check(len(pending) == 1, "заявка видна получателю вне окна")
+        check(b.post("/api/user/swaps/%d" % pending[0]["id"],
+                     json={"action": "decline"}).status_code == 200,
+              "ответить на заявку вне окна тоже можно")
+    finally:
+        db.window_state = original
 
 
 def test_daily_reset():
