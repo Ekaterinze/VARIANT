@@ -1,0 +1,11 @@
+.git
+.gitignore
+.claude
+__pycache__/
+*.pyc
+data/
+logs/
+test_all.py
+run.bat
+README.md
+DEPLOY.md

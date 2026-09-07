@@ -1,0 +1,31 @@
+# Blueprint для Render.com — можно не заполнять поля в веб-интерфейсе вручную.
+# Render → New → Blueprint → выбрать этот репозиторий.
+services:
+  - type: web
+    name: lab-queue
+    runtime: docker
+    plan: free
+    region: frankfurt          # ближайший к России регион Render
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: APP_TZ
+        value: Europe/Moscow   # расписание 19:55 / 20:00-21:00 в этом поясе
+      - key: SECRET_KEY
+        generateValue: true    # Render создаст случайный ключ подписи cookie
+      - key: SECURE_COOKIES
+        value: "1"             # Render отдаёт сайт по HTTPS
+      - key: DATABASE_URL
+        sync: false            # ЗАДАТЬ ВРУЧНУЮ: строка подключения к Postgres (Neon)
+      - key: DATA_DIR
+        value: /data
+      - key: LOG_DIR
+        value: /data/logs
+
+    # Постоянный диск доступен только на платных тарифах. Если перейдёте на
+    # Starter, раскомментируйте — база и журналы переживут перезапуски:
+    # disk:
+    #   name: lab-data
+    #   mountPath: /data
+    #   sizeGB: 1

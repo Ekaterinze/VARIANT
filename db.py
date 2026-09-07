@@ -9,14 +9,34 @@ import secrets
 import string
 from datetime import datetime, time, timedelta
 
+try:                                   # Python 3.9+
+    from zoneinfo import ZoneInfo
+except ImportError:                    # pragma: no cover
+    ZoneInfo = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-DB_PATH = os.path.join(DATA_DIR, "lab.db")
-PEOPLE_FILE = os.path.join(BASE_DIR, "Люди.txt")
+DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(BASE_DIR, "data")
+LOG_DIR = os.environ.get("LOG_DIR") or os.path.join(BASE_DIR, "logs")
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "lab.db")
+PEOPLE_FILE = os.environ.get("PEOPLE_FILE") or os.path.join(BASE_DIR, "Люди.txt")
 PASSWORDS_FILE = os.path.join(DATA_DIR, "Пароли.txt")
 
-ADMIN_FULL_NAME = "Пархачева Екатерина Евгеньевна"
+ADMIN_FULL_NAME = os.environ.get("ADMIN_FULL_NAME") or "Пархачева Екатерина Евгеньевна"
+
+# Часовой пояс расписания. На хостинге (Render и т.п.) система живёт по UTC,
+# поэтому время окна 20:00-21:00 всегда считаем в этом поясе.
+TZ_NAME = os.environ.get("APP_TZ") or "Europe/Moscow"
+try:
+    TZ = ZoneInfo(TZ_NAME) if ZoneInfo else None
+except Exception:                      # нет базы часовых поясов — берём системное время
+    TZ = None
+
+
+def local_now():
+    """Текущее время в часовом поясе расписания (наивный datetime)."""
+    if TZ is None:
+        return datetime.now()
+    return datetime.now(TZ).replace(tzinfo=None)
 
 # Окно доступности сайта для обычных пользователей
 OPEN_FROM = time(20, 0)
@@ -28,10 +48,69 @@ PASSWORD_LEN = 6
 PASSWORD_ALPHABET = string.ascii_letters + string.digits
 PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 
+# Стартовый пароль у всех одинаковый, дальше каждый меняет его сам.
+DEFAULT_PASSWORD = os.environ.get("DEFAULT_PASSWORD") or "a12345"
+
 
 # ---------------------------------------------------------------- соединение
 
+# Если задана переменная DATABASE_URL (например, бесплатная база Neon.tech или
+# Postgres на Render), данные хранятся в Postgres и переживают перезапуск
+# сервиса. Без неё используется локальный файл SQLite.
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+USE_POSTGRES = DATABASE_URL.startswith("postgres")
+
+
+def _pg_sql(sql):
+    """Переводит запрос из диалекта SQLite в Postgres: ? -> %s.
+
+    В наших запросах знак вопроса встречается только как место подстановки,
+    внутри текстовых констант его нет.
+    """
+    return sql.replace("?", "%s")
+
+
+class PgConnection:
+    """Обёртка над psycopg с интерфейсом sqlite3.Connection.
+
+    Благодаря ей весь остальной код (запросы с «?») одинаково работает
+    и с SQLite, и с Postgres.
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, params=()):
+        return self._raw.execute(_pg_sql(sql), tuple(params))
+
+    def executemany(self, sql, rows):
+        cur = self._raw.cursor()
+        cur.executemany(_pg_sql(sql), [tuple(r) for r in rows])
+        return cur
+
+    def executescript(self, script):
+        cur = self._raw.cursor()
+        cur.execute(script)
+        return cur
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        self._raw.close()
+
+
 def connect():
+    if USE_POSTGRES:
+        import psycopg
+        from psycopg.rows import dict_row
+        # connect_timeout: если база недоступна, запрос не должен висеть вечно
+        return PgConnection(psycopg.connect(
+            DATABASE_URL, row_factory=dict_row,
+            connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "10"))))
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -109,8 +188,13 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
+def pg_schema():
+    """Та же схема на диалекте Postgres."""
+    return SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+
+
 def init_schema(conn):
-    conn.executescript(SCHEMA)
+    conn.executescript(pg_schema() if USE_POSTGRES else SCHEMA)
     conn.commit()
 
 
@@ -180,6 +264,11 @@ def seconds_to_open(now=None):
 
 def generate_password():
     return "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LEN))
+
+
+def initial_password(key=None):
+    """Стартовый пароль, одинаковый для всех: его участник меняет сам."""
+    return DEFAULT_PASSWORD
 
 
 def hash_password(password, salt=None):
@@ -261,7 +350,7 @@ def import_people(conn, path=PEOPLE_FILE):
         key = login_key(full_name)
         if conn.execute("SELECT id FROM users WHERE login_key = ?", (key,)).fetchone():
             continue
-        password = generate_password()
+        password = initial_password(key)
         pwd_hash, salt = hash_password(password)
         is_admin = 1 if key == login_key(ADMIN_FULL_NAME) else 0
         conn.execute(
@@ -271,6 +360,21 @@ def import_people(conn, path=PEOPLE_FILE):
         )
         created.append((full_name, password))
     conn.commit()
+    return created
+
+
+def ensure_seeded(conn):
+    """Заводит людей при первом запуске (нужно на хостинге с чистым диском).
+
+    Возвращает список пар (ФИО, пароль) — пустой, если все уже заведены.
+    """
+    if not os.path.exists(PEOPLE_FILE):
+        return []
+    created = import_people(conn)
+    if created:
+        log(conn, "СИСТЕМА", "SEED",
+            "база была пуста: заведено пользователей %d, стартовый пароль у всех одинаковый"
+            % len(created))
     return created
 
 
@@ -415,12 +519,15 @@ def seconds_to_reset(now=None):
 # ------------------------------------------------------------- обмен местами
 
 def create_swap(conn, day, from_user, to_user, from_place, to_place):
-    cur = conn.execute(
-        "INSERT INTO swaps(day, from_user, to_user, from_place, to_place, status, created_at)"
-        " VALUES(?,?,?,?,?, 'pending', ?)",
-        (day, from_user, to_user, from_place, to_place,
-         local_now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
+    sql = ("INSERT INTO swaps(day, from_user, to_user, from_place, to_place, status,"
+           " created_at) VALUES(?,?,?,?,?, 'pending', ?)")
+    params = (day, from_user, to_user, from_place, to_place,
+              local_now().strftime("%Y-%m-%d %H:%M:%S"))
+    if USE_POSTGRES:                       # у Postgres номер строки берём из RETURNING
+        row = conn.execute(sql + " RETURNING id", params).fetchone()
+        conn.commit()
+        return row["id"]
+    cur = conn.execute(sql, params)
     conn.commit()
     return cur.lastrowid
 

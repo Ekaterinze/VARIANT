@@ -34,6 +34,10 @@ app = Flask(__name__)
 
 
 def _secret_key():
+    """Ключ подписи cookie: из переменной SECRET_KEY либо из файла рядом с базой."""
+    from_env = os.environ.get("SECRET_KEY")
+    if from_env:
+        return from_env
     os.makedirs(db.DATA_DIR, exist_ok=True)
     if not os.path.exists(SECRET_FILE):
         with open(SECRET_FILE, "w", encoding="utf-8") as fh:
@@ -44,6 +48,8 @@ def _secret_key():
 
 app.secret_key = _secret_key()
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# На хостинге сайт работает по HTTPS — cookie стоит помечать как Secure.
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SECURE_COOKIES", "0") == "1"
 app.config["JSON_AS_ASCII"] = False
 
 STATUS_TEXT = {
@@ -112,12 +118,27 @@ def api_admin_required(view):
     return wrapper
 
 
+_reset_checked_for = None
+
+
 @app.before_request
 def before_any_request():
-    """Гарантирует, что сброс в 19:55 произойдёт, даже если сервер был выключен."""
+    """Гарантирует, что сброс в 19:55 произойдёт, даже если сервер был выключен.
+
+    Проверка делается не чаще раза в день на процесс: до 19:55 делать нечего,
+    а после первого срабатывания повторно ходить в базу незачем.
+    """
+    global _reset_checked_for
+    now = db.local_now()
+    if now.time() < db.RESET_AT:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if _reset_checked_for == today:
+        return
     conn = get_conn()
     try:
-        db.ensure_daily_reset(conn)
+        db.ensure_daily_reset(conn, now)
+        _reset_checked_for = today
     finally:
         conn.close()
 
@@ -147,6 +168,27 @@ def user_payload(user):
 @app.route("/")
 def spa():
     return render_template("index.html")
+
+
+@app.route("/healthz")
+def healthz():
+    """Проверка живости для хостинга (Render дергает этот адрес)."""
+    info = {"time": db.local_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tz": db.TZ_NAME,
+            "storage": "postgres" if db.USE_POSTGRES else "sqlite"}
+    try:
+        conn = get_conn()
+        try:
+            info["users"] = len(db.all_users(conn))
+            info["window"] = db.window_state(conn)[0]
+        finally:
+            conn.close()
+    except Exception as exc:                      # noqa: BLE001
+        info["status"] = "error"
+        info["error"] = "база недоступна: %s" % exc
+        return jsonify(info), 503
+    info["status"] = "ok"
+    return jsonify(info)
 
 
 # ------------------------------------------------------------------- сессия
@@ -244,6 +286,8 @@ def api_user_state(conn, user):
         "day": day,
         "places": db.places_count(conn),
         "can_edit": can_edit,
+        "password_is_default": db.check_password(
+            db.DEFAULT_PASSWORD, user["pwd_hash"], user["pwd_salt"]),
         "pref": ({"p1": pref["p1"], "p2": pref["p2"], "p3": pref["p3"],
                   "updated_at": pref["updated_at"]} if pref else None),
         "report_day": report_day,
@@ -301,6 +345,34 @@ def api_delete_prefs(conn, user):
     db.delete_preference(conn, today_str(), user["id"])
     db.log(conn, user["full_name"], "PREFS_DELETE", "пожелания отозваны")
     return jsonify({"ok": True, "message": "Пожелания удалены. Место будет выдано случайно."})
+
+
+# --------------------------------------------------------- смена своего пароля
+
+@app.route("/api/user/password", methods=["POST"])
+@api_login_required
+def api_change_own_password(conn, user):
+    """Смена пароля самим участником: старый пароль и новый дважды."""
+    data = request.get_json(silent=True) or {}
+    old = data.get("old_password") or ""
+    new1 = (data.get("new_password") or "").strip()
+    new2 = (data.get("new_password2") or "").strip()
+
+    if not db.check_password(old, user["pwd_hash"], user["pwd_salt"]):
+        db.log(conn, user["full_name"], "PASSWORD_SELF_FAIL",
+               "попытка смены пароля с неверным старым паролем", level="WARNING")
+        return fail("Старый пароль указан неверно.", 403)
+    if new1 != new2:
+        return fail("Новый пароль введён по-разному — повторите ввод.")
+    if not db.PASSWORD_RE.match(new1):
+        return fail("Новый пароль — ровно 6 символов: английские буквы и цифры.")
+    if new1 == old:
+        return fail("Новый пароль совпадает со старым.")
+
+    db.set_user_password(conn, user["id"], new1)
+    db.log(conn, user["full_name"], "PASSWORD_SELF_CHANGE", "пользователь сменил себе пароль")
+    return jsonify({"ok": True,
+                    "message": "Пароль изменён. В следующий раз входите с новым паролем."})
 
 
 # ------------------------------------------------------------- обмен местами
@@ -424,6 +496,8 @@ def api_admin_overview(conn, user):
         "day": day,
         "places": db.places_count(conn),
         "test_mode": db.test_mode(conn),
+        "password_is_default": db.check_password(
+            db.DEFAULT_PASSWORD, user["pwd_hash"], user["pwd_salt"]),
         "people": people,
         "submitted": len(prefs),
         "meta": ({"created_at": meta["created_at"], "created_by": meta["created_by"],
@@ -692,10 +766,38 @@ def start_scheduler():
     return thread
 
 
+# --------------------------------------------------------------- старт сервиса
+
+def startup(seed=True, scheduler=True):
+    """Готовит приложение к работе: схема, список людей, планировщик сброса.
+
+    Вызывается и при локальном запуске, и под gunicorn на хостинге, где диск
+    может быть чистым после каждого перезапуска.
+    """
+    print("Хранилище: %s" % ("Postgres (DATABASE_URL)" if db.USE_POSTGRES
+                              else "SQLite %s" % db.DB_PATH))
+    try:
+        conn = get_conn()
+        try:
+            if seed and os.environ.get("AUTO_SEED", "1") == "1":
+                created = db.ensure_seeded(conn)
+                if created:
+                    print("Заведено пользователей: %d, стартовый пароль: %s"
+                          % (len(created), db.DEFAULT_PASSWORD))
+            if not db.all_users(conn):
+                print("База пуста. Выполните: python init_db.py")
+        finally:
+            conn.close()
+    except Exception as exc:                      # noqa: BLE001
+        # Сервис всё равно поднимаем: иначе хостинг уходит в бесконечный
+        # перезапуск, а причина не видна. Ошибку покажет /healthz.
+        print("ОШИБКА подключения к базе: %s" % exc)
+    if scheduler:
+        start_scheduler()
+
+
+startup(scheduler=os.environ.get("RUN_SCHEDULER", "1") == "1")
+
+
 if __name__ == "__main__":
-    conn = get_conn()
-    if not db.all_users(conn):
-        print("База пуста. Сначала выполните: python init_db.py")
-    conn.close()
-    start_scheduler()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)

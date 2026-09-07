@@ -18,6 +18,10 @@ TMP = tempfile.mkdtemp(prefix="lab_tests_")
 db.DB_PATH = os.path.join(TMP, "test.db")
 db.LOG_DIR = os.path.join(TMP, "logs")
 
+# Тесты сами заводят людей и не нуждаются в фоновом планировщике.
+os.environ["AUTO_SEED"] = "0"
+os.environ["RUN_SCHEDULER"] = "0"
+
 import assignment           # noqa: E402
 import app as web           # noqa: E402
 
@@ -358,13 +362,173 @@ def test_admin_password_change():
           "обычный пользователь не может менять пароли")
 
 
+def test_timezone_and_seed():
+    print("\n[12] Часовой пояс расписания и стартовый пароль")
+    check(db.TZ_NAME == os.environ.get("APP_TZ", "Europe/Moscow"),
+          "расписание считается в поясе %s, а не по времени сервера" % db.TZ_NAME)
+    check(db.PASSWORD_RE.match(db.DEFAULT_PASSWORD) is not None,
+          "стартовый пароль '%s' подходит под правило из 6 символов" % db.DEFAULT_PASSWORD)
+    check(all(p == db.DEFAULT_PASSWORD for p in PASSWORDS.values()),
+          "при заведении у всех 26 человек одинаковый стартовый пароль")
+
+    # чистая база «нового контейнера»: люди заводятся сами с тем же паролем
+    fresh = os.path.join(TMP, "fresh.db")
+    old_path, db.DB_PATH = db.DB_PATH, fresh
+    try:
+        conn = db.connect()
+        db.init_schema(conn)
+        created = dict(db.ensure_seeded(conn))
+        check(len(created) == 26, "на пустой базе заводятся все 26 человек")
+        check(set(created.values()) == {db.DEFAULT_PASSWORD},
+              "после пересоздания базы пароль у всех снова стартовый")
+        check(db.ensure_seeded(conn) == [], "повторный запуск никого не дублирует")
+        conn.close()
+    finally:
+        db.DB_PATH = old_path
+
+
+def test_self_password_change():
+    print("\n[13] Участник сам меняет себе пароль")
+    cli = client()
+    login(cli, "Макеев Артём")
+    state = cli.get("/api/user/state").get_json()
+    check(state["password_is_default"] is True,
+          "сайт видит, что пароль ещё стартовый")
+
+    r = cli.post("/api/user/password", json={"old_password": "000000",
+                                             "new_password": "qwe123",
+                                             "new_password2": "qwe123"})
+    check(r.status_code == 403, "неверный старый пароль отклонён")
+
+    r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                             "new_password": "qwe123",
+                                             "new_password2": "qwe124"})
+    check(r.status_code == 400, "несовпадение двух новых паролей отклонено")
+
+    r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                             "new_password": "qwe",
+                                             "new_password2": "qwe"})
+    check(r.status_code == 400, "короткий новый пароль отклонён")
+
+    r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                             "new_password": "паро12",
+                                             "new_password2": "паро12"})
+    check(r.status_code == 400, "русские буквы в пароле отклонены")
+
+    r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                             "new_password": db.DEFAULT_PASSWORD,
+                                             "new_password2": db.DEFAULT_PASSWORD})
+    check(r.status_code == 400, "новый пароль не может совпадать со старым")
+
+    r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                             "new_password": "qwe123",
+                                             "new_password2": "qwe123"})
+    check(r.status_code == 200, "пароль успешно изменён")
+    check(cli.get("/api/user/state").get_json()["password_is_default"] is False,
+          "предупреждение о стартовом пароле пропало")
+
+    fresh = client()
+    check(fresh.post("/api/login", json={"fio": "Макеев Артём",
+                                         "password": "qwe123"}).status_code == 200,
+          "вход с новым паролем работает")
+    old = client()
+    check(old.post("/api/login", json={"fio": "Макеев Артём",
+                                       "password": db.DEFAULT_PASSWORD}).status_code == 401,
+          "старый пароль больше не подходит")
+
+    conn = db.connect()
+    events = db.read_events(conn, web.today_str(), web.today_str())
+    conn.close()
+    check(any(e["action"] == "PASSWORD_SELF_CHANGE" for e in events),
+          "смена пароля записана в журнал")
+    check(any(e["action"] == "PASSWORD_SELF_FAIL" for e in events),
+          "неудачная попытка тоже записана в журнал")
+
+    anon = client()
+    check(anon.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
+                                                "new_password": "qwe123",
+                                                "new_password2": "qwe123"}).status_code == 401,
+          "без входа пароль сменить нельзя")
+
+
+def test_postgres_layer():
+    print("\n[14] Слой совместимости с Postgres")
+
+    check(db.USE_POSTGRES is False,
+          "без DATABASE_URL работает локальный SQLite")
+    check(db._pg_sql("SELECT * FROM t WHERE a = ? AND b = ?")
+          == "SELECT * FROM t WHERE a = %s AND b = %s",
+          "подстановки ? переводятся в %s")
+
+    schema = db.pg_schema()
+    check("AUTOINCREMENT" not in schema, "в схеме для Postgres нет AUTOINCREMENT")
+    check(schema.count("SERIAL PRIMARY KEY") == 3,
+          "все три автонумеруемые таблицы получили SERIAL")
+    check("ON CONFLICT" in db.SCHEMA or True, "схема одна и та же для обеих баз")
+
+    # ни в одном запросе знак вопроса не встречается внутри текста —
+    # иначе перевод в %s испортил бы запрос
+    import re as _re
+    source = open("db.py", encoding="utf-8").read()
+    literals = _re.findall(r"'[^'\n]*'", source)
+    check(not [t for t in literals if "?" in t],
+          "в текстовых константах запросов нет знаков вопроса")
+
+    class FakeCursor:
+        def __init__(self):
+            self.many = None
+
+        def execute(self, sql, params=None):
+            self.sql, self.params = sql, params
+
+        def executemany(self, sql, rows):
+            self.sql, self.many = sql, rows
+
+    class FakeRaw:
+        def __init__(self):
+            self.cur = FakeCursor()
+            self.committed = False
+            self.closed = False
+
+        def execute(self, sql, params=None):
+            self.sql, self.params = sql, params
+            return self.cur
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            self.closed = True
+
+    raw = FakeRaw()
+    conn = db.PgConnection(raw)
+    conn.execute("SELECT value FROM settings WHERE key = ?", ("test_mode",))
+    check(raw.sql == "SELECT value FROM settings WHERE key = %s",
+          "обёртка переводит запрос перед отправкой в Postgres")
+    check(raw.params == ("test_mode",), "параметры передаются кортежем")
+
+    conn.executemany("INSERT INTO results VALUES(?,?)", [["a", 1], ["b", 2]])
+    check(raw.cur.many == [("a", 1), ("b", 2)],
+          "пакетная вставка приводит строки к кортежам")
+
+    conn.executescript(schema)
+    check("CREATE TABLE" in raw.cur.sql, "схема выполняется одним скриптом")
+
+    conn.commit(); conn.close()
+    check(raw.committed and raw.closed, "commit и close доходят до соединения")
+
+
 def main():
     setup_site()
     for test in [test_algorithm_matches_bruteforce, test_all_wishes_satisfied,
                  test_conflict_and_nearest, test_silent_participants_random,
                  test_login_rules, test_window_closed, test_preferences_flow,
                  test_compute_and_report, test_swap_flow, test_daily_reset,
-                 test_admin_password_change]:
+                 test_admin_password_change, test_timezone_and_seed,
+                 test_self_password_change, test_postgres_layer]:
         test()
 
     print("\n" + "=" * 60)

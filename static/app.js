@@ -108,6 +108,80 @@
     `,
   };
 
+  /* -------------------------------------------------------- смена пароля */
+
+  const PasswordCard = {
+    props: ["isDefault"],
+    emits: ["changed"],
+    setup(props, ctx) {
+      const form = reactive({ old_password: "", new_password: "", new_password2: "" });
+      const busy = ref(false);
+      const open = ref(false);
+
+      async function submit() {
+        busy.value = true;
+        try {
+          const data = await api("/api/user/password", { method: "POST", body: { ...form } });
+          notify(data.message, "ok");
+          form.old_password = form.new_password = form.new_password2 = "";
+          open.value = false;
+          ctx.emit("changed");
+        } catch (e) {
+          notify(e.message, "error");
+        } finally {
+          busy.value = false;
+        }
+      }
+
+      return { form, busy, open, submit };
+    },
+    template: `
+      <div class="card">
+        <h2>Мой пароль</h2>
+        <p class="sub" v-if="isDefault">
+          Сейчас у вас стандартный пароль, который знают все. Смените его на свой:
+          ровно 6 символов, английские буквы и цифры.
+        </p>
+        <p class="sub" v-else>
+          Пароль можно поменять в любой момент: введите старый и дважды новый
+          (6 символов, английские буквы и цифры).
+        </p>
+
+        <div class="banner closed" v-if="isDefault && !open">
+          Пароль по умолчанию — смените его, иначе войти сможет кто угодно.
+        </div>
+
+        <button class="ghost" v-if="!open" @click="open = true">Сменить пароль</button>
+
+        <form v-else @submit.prevent="submit">
+          <div class="row">
+            <div>
+              <label>Старый пароль</label>
+              <input type="password" v-model="form.old_password" maxlength="6"
+                     autocomplete="current-password">
+            </div>
+            <div>
+              <label>Новый пароль</label>
+              <input type="password" v-model="form.new_password" maxlength="6"
+                     autocomplete="new-password">
+            </div>
+            <div>
+              <label>Новый пароль ещё раз</label>
+              <input type="password" v-model="form.new_password2" maxlength="6"
+                     autocomplete="new-password">
+            </div>
+          </div>
+          <div class="row tight" style="margin-top:14px">
+            <button type="submit" :disabled="busy">Сохранить новый пароль</button>
+            <button type="button" class="ghost" @click="open = false" :disabled="busy">
+              Отмена
+            </button>
+          </div>
+        </form>
+      </div>
+    `,
+  };
+
   /* ------------------------------------------------------- страница участника */
 
   const UserView = {
@@ -226,6 +300,7 @@
       return { state, picks, placeList, swapTarget, busy, incoming, outgoing, history,
                savePrefs, dropPrefs, proposeSwap, respond, load };
     },
+    components: { PasswordCard },
     template: `
       <div v-if="state.loading" class="card">Загружаем данные…</div>
       <div v-else-if="state.data">
@@ -235,6 +310,9 @@
             До открытия: <b>{{ window.countdown }}</b>
           </span>
         </div>
+
+        <password-card :is-default="state.data.password_is_default"
+                       @changed="load"></password-card>
 
         <div class="card">
           <h2>Мои пожелания на {{ state.data.day }}</h2>
@@ -487,6 +565,7 @@
                settings, logFrom, logTo, openTab, compute, resetNow, saveSettings,
                changePassword, loadOverview, loadReport, loadLogs };
     },
+    components: { PasswordCard },
     template: `
       <div class="tabs">
         <button :class="{active: tab === 'overview'}" @click="openTab('overview')">Обзор дня</button>
@@ -568,6 +647,9 @@
 
       <!-- ------------------------------------------------------ пользователи -->
       <template v-if="tab === 'users' && overview">
+        <password-card :is-default="overview.password_is_default"
+                       @changed="loadOverview"></password-card>
+
         <div class="card">
           <h2>Пользователи и пароли</h2>
           <p class="sub">
