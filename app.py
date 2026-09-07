@@ -365,7 +365,8 @@ def api_change_own_password(conn, user):
     if new1 != new2:
         return fail("Новый пароль введён по-разному — повторите ввод.")
     if not db.PASSWORD_RE.match(new1):
-        return fail("Новый пароль — ровно 6 символов: английские буквы и цифры.")
+        return fail("Новый пароль — ровно %d символов: английские буквы и цифры."
+                    % db.PASSWORD_LEN)
     if new1 == old:
         return fail("Новый пароль совпадает со старым.")
 
@@ -524,8 +525,8 @@ def api_admin_password(conn, user):
     if data.get("mode") == "manual":
         password = (data.get("password") or "").strip()
         if not db.PASSWORD_RE.match(password):
-            return fail("Пароль должен состоять ровно из 6 символов: "
-                        "английские буквы и цифры.")
+            return fail("Пароль должен состоять ровно из %d символов: "
+                        "английские буквы и цифры." % db.PASSWORD_LEN)
     else:
         password = db.generate_password()
 

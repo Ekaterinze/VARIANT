@@ -90,9 +90,9 @@
           <form @submit.prevent="submit">
             <label for="fio">Фамилия и имя</label>
             <input id="fio" v-model="fio" placeholder="Иванова Анна" autocomplete="username">
-            <label for="pw">Пароль (6 символов)</label>
-            <input id="pw" v-model="password" type="password" maxlength="6"
-                   autocomplete="current-password" placeholder="••••••">
+            <label for="pw">Пароль (7 символов)</label>
+            <input id="pw" v-model="password" type="password" maxlength="7"
+                   autocomplete="current-password" placeholder="•••••••">
             <div style="margin-top:16px">
               <button type="submit" :disabled="busy">
                 {{ busy ? 'Проверяем…' : 'Войти' }}
@@ -140,11 +140,11 @@
         <h2>Мой пароль</h2>
         <p class="sub" v-if="isDefault">
           Сейчас у вас стандартный пароль, который знают все. Смените его на свой:
-          ровно 6 символов, английские буквы и цифры.
+          ровно 7 символов, английские буквы и цифры.
         </p>
         <p class="sub" v-else>
           Пароль можно поменять в любой момент: введите старый и дважды новый
-          (6 символов, английские буквы и цифры).
+          (7 символов, английские буквы и цифры).
         </p>
 
         <div class="banner closed" v-if="isDefault && !open">
@@ -157,17 +157,17 @@
           <div class="row">
             <div>
               <label>Старый пароль</label>
-              <input type="password" v-model="form.old_password" maxlength="6"
+              <input type="password" v-model="form.old_password" maxlength="7"
                      autocomplete="current-password">
             </div>
             <div>
               <label>Новый пароль</label>
-              <input type="password" v-model="form.new_password" maxlength="6"
+              <input type="password" v-model="form.new_password" maxlength="7"
                      autocomplete="new-password">
             </div>
             <div>
               <label>Новый пароль ещё раз</label>
-              <input type="password" v-model="form.new_password2" maxlength="6"
+              <input type="password" v-model="form.new_password2" maxlength="7"
                      autocomplete="new-password">
             </div>
           </div>
@@ -565,14 +565,20 @@
                settings, logFrom, logTo, openTab, compute, resetNow, saveSettings,
                changePassword, loadOverview, loadReport, loadLogs };
     },
-    components: { PasswordCard },
+    components: { UserView },
     template: `
       <div class="tabs">
         <button :class="{active: tab === 'overview'}" @click="openTab('overview')">Обзор дня</button>
+        <button :class="{active: tab === 'mine'}" @click="openTab('mine')">Мои пожелания</button>
         <button :class="{active: tab === 'users'}" @click="openTab('users')">Пользователи и пароли</button>
         <button :class="{active: tab === 'report'}" @click="openTab('report')">Отчёт</button>
         <button :class="{active: tab === 'logs'}" @click="openTab('logs')">Журнал</button>
       </div>
+
+      <!-- ------------------------------------- мои пожелания (админ тоже участник) -->
+      <template v-if="tab === 'mine'">
+        <user-view :user="user" :window="window"></user-view>
+      </template>
 
       <!-- ------------------------------------------------------- обзор дня -->
       <template v-if="tab === 'overview' && overview">
@@ -647,13 +653,10 @@
 
       <!-- ------------------------------------------------------ пользователи -->
       <template v-if="tab === 'users' && overview">
-        <password-card :is-default="overview.password_is_default"
-                       @changed="loadOverview"></password-card>
-
         <div class="card">
           <h2>Пользователи и пароли</h2>
           <p class="sub">
-            Пароль — ровно 6 символов: английские буквы и цифры. Можно сгенерировать
+            Пароль — ровно 7 символов: английские буквы и цифры. Можно сгенерировать
             случайный или задать вручную.
           </p>
           <div class="pw-box" v-if="newPassword">
@@ -669,7 +672,7 @@
                 <tr v-for="p in overview.people" :key="p.id">
                   <td>{{ p.full_name }}
                     <span class="pill accent" v-if="p.is_admin">админ</span></td>
-                  <td><input v-model="manualPw[p.id]" maxlength="6" placeholder="например ab12cd"></td>
+                  <td><input v-model="manualPw[p.id]" maxlength="7" placeholder="например ab12cd7"></td>
                   <td>
                     <button class="small" @click="changePassword(p, 'manual')"
                             :disabled="busy">Задать</button>

@@ -44,12 +44,12 @@ OPEN_TO = time(21, 0)
 # За пять минут до открытия старые пожелания стираются, сайт готов к новому дню
 RESET_AT = time(19, 55)
 
-PASSWORD_LEN = 6
+PASSWORD_LEN = 7
 PASSWORD_ALPHABET = string.ascii_letters + string.digits
-PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{6}$")
+PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{7}$")
 
 # Стартовый пароль у всех одинаковый, дальше каждый меняет его сам.
-DEFAULT_PASSWORD = os.environ.get("DEFAULT_PASSWORD") or "a12345"
+DEFAULT_PASSWORD = os.environ.get("DEFAULT_PASSWORD") or "a123456"
 
 
 # ---------------------------------------------------------------- соединение

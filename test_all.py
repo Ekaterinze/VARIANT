@@ -146,7 +146,7 @@ def test_login_rules():
     check(r.get_json()["user"]["is_admin"] is True, "Пархачева Екатерина — администратор")
 
     check(all(db.PASSWORD_RE.match(p) for p in PASSWORDS.values()),
-          "все пароли из 6 символов (буквы и цифры)")
+          "все пароли из 7 символов (буквы и цифры)")
 
 
 def test_window_closed():
@@ -337,23 +337,23 @@ def test_admin_password_change():
                                               "password": "short"})
     check(r.status_code == 400, "пароль неверной длины отклонён")
     r = adm.post("/api/admin/password", json={"user_id": target["id"], "mode": "manual",
-                                              "password": "ab12CD"})
+                                              "password": "ab12CD7"})
     check(r.status_code == 200, "пароль задан вручную")
 
     cli = client()
-    r = cli.post("/api/login", json={"fio": "Пуртова Софья", "password": "ab12CD"})
+    r = cli.post("/api/login", json={"fio": "Пуртова Софья", "password": "ab12CD7"})
     check(r.status_code == 200, "вход с новым паролем работает")
 
     r = adm.post("/api/admin/password", json={"user_id": target["id"], "mode": "generate"})
     generated = r.get_json()["password"]
-    check(db.PASSWORD_RE.match(generated) is not None, "сгенерирован пароль из 6 символов")
+    check(db.PASSWORD_RE.match(generated) is not None, "сгенерирован пароль из 7 символов")
     cli = client()
     check(cli.post("/api/login", json={"fio": "Пуртова Софья",
                                        "password": generated}).status_code == 200,
           "вход со сгенерированным паролем работает")
     old = client()
     check(old.post("/api/login", json={"fio": "Пуртова Софья",
-                                       "password": "ab12CD"}).status_code == 401,
+                                       "password": "ab12CD7"}).status_code == 401,
           "старый пароль больше не подходит")
 
     plain = client(); login(plain, "Иванова Анна")
@@ -367,7 +367,8 @@ def test_timezone_and_seed():
     check(db.TZ_NAME == os.environ.get("APP_TZ", "Europe/Moscow"),
           "расписание считается в поясе %s, а не по времени сервера" % db.TZ_NAME)
     check(db.PASSWORD_RE.match(db.DEFAULT_PASSWORD) is not None,
-          "стартовый пароль '%s' подходит под правило из 6 символов" % db.DEFAULT_PASSWORD)
+          "стартовый пароль '%s' подходит под правило из %d символов"
+          % (db.DEFAULT_PASSWORD, db.PASSWORD_LEN))
     check(all(p == db.DEFAULT_PASSWORD for p in PASSWORDS.values()),
           "при заведении у всех 26 человек одинаковый стартовый пароль")
 
@@ -396,13 +397,13 @@ def test_self_password_change():
           "сайт видит, что пароль ещё стартовый")
 
     r = cli.post("/api/user/password", json={"old_password": "000000",
-                                             "new_password": "qwe123",
-                                             "new_password2": "qwe123"})
+                                             "new_password": "qwe1234",
+                                             "new_password2": "qwe1234"})
     check(r.status_code == 403, "неверный старый пароль отклонён")
 
     r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
-                                             "new_password": "qwe123",
-                                             "new_password2": "qwe124"})
+                                             "new_password": "qwe1234",
+                                             "new_password2": "qwe1235"})
     check(r.status_code == 400, "несовпадение двух новых паролей отклонено")
 
     r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
@@ -411,8 +412,8 @@ def test_self_password_change():
     check(r.status_code == 400, "короткий новый пароль отклонён")
 
     r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
-                                             "new_password": "паро12",
-                                             "new_password2": "паро12"})
+                                             "new_password": "парол12",
+                                             "new_password2": "парол12"})
     check(r.status_code == 400, "русские буквы в пароле отклонены")
 
     r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
@@ -421,15 +422,15 @@ def test_self_password_change():
     check(r.status_code == 400, "новый пароль не может совпадать со старым")
 
     r = cli.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
-                                             "new_password": "qwe123",
-                                             "new_password2": "qwe123"})
+                                             "new_password": "qwe1234",
+                                             "new_password2": "qwe1234"})
     check(r.status_code == 200, "пароль успешно изменён")
     check(cli.get("/api/user/state").get_json()["password_is_default"] is False,
           "предупреждение о стартовом пароле пропало")
 
     fresh = client()
     check(fresh.post("/api/login", json={"fio": "Макеев Артём",
-                                         "password": "qwe123"}).status_code == 200,
+                                         "password": "qwe1234"}).status_code == 200,
           "вход с новым паролем работает")
     old = client()
     check(old.post("/api/login", json={"fio": "Макеев Артём",
@@ -446,8 +447,8 @@ def test_self_password_change():
 
     anon = client()
     check(anon.post("/api/user/password", json={"old_password": db.DEFAULT_PASSWORD,
-                                                "new_password": "qwe123",
-                                                "new_password2": "qwe123"}).status_code == 401,
+                                                "new_password": "qwe1234",
+                                                "new_password2": "qwe1234"}).status_code == 401,
           "без входа пароль сменить нельзя")
 
 
@@ -521,6 +522,46 @@ def test_postgres_layer():
     check(raw.committed and raw.closed, "commit и close доходят до соединения")
 
 
+def test_admin_is_participant():
+    print("\n[15] Администратор тоже участвует в распределении")
+    adm = client()
+    login(adm, "Пархачева Екатерина")
+
+    r = adm.post("/api/user/prefs", json={"p1": 11, "p2": 12, "p3": 13})
+    check(r.status_code == 200, "администратор может отправить свои пожелания")
+
+    state = adm.get("/api/user/state").get_json()
+    check(state["pref"]["p1"] == 11, "пожелания администратора сохранены")
+
+    r = adm.post("/api/user/prefs", json={"p1": 14, "p2": 15, "p3": 16})
+    check(r.status_code == 200 and
+          adm.get("/api/user/state").get_json()["pref"]["p1"] == 14,
+          "администратор может их отредактировать")
+
+    day = web.today_str()
+    check(adm.post("/api/admin/compute", json={"day": day}).status_code == 200,
+          "расчёт выполняется")
+    report = adm.get("/api/admin/report?day=" + day).get_json()
+    mine = [r_ for r_ in report["rows"] if r_["full_name"] == "Пархачева Екатерина Евгеньевна"][0]
+    check(mine["place"] in (14, 15, 16), "администратор получил одно из желаемых мест")
+    check(mine["status"] == "satisfied", "его пожелание учтено наравне с остальными")
+
+    state = adm.get("/api/user/state").get_json()
+    check(state["my_result"]["place"] == mine["place"],
+          "своё место администратор видит на странице пожеланий")
+    check(len(state["candidates"]) == 25,
+          "администратору доступен обмен с остальными 25 участниками")
+
+    original = db.window_state
+    db.window_state = lambda conn, now=None: ("closed", "Тест: окно закрыто.")
+    try:
+        r = adm.post("/api/user/prefs", json={"p1": 1, "p2": 2, "p3": 3})
+        check(r.status_code == 403,
+              "вне окна 20:00-21:00 пожелания не принимаются даже от администратора")
+    finally:
+        db.window_state = original
+
+
 def main():
     setup_site()
     for test in [test_algorithm_matches_bruteforce, test_all_wishes_satisfied,
@@ -528,7 +569,8 @@ def main():
                  test_login_rules, test_window_closed, test_preferences_flow,
                  test_compute_and_report, test_swap_flow, test_daily_reset,
                  test_admin_password_change, test_timezone_and_seed,
-                 test_self_password_change, test_postgres_layer]:
+                 test_self_password_change, test_postgres_layer,
+                 test_admin_is_participant]:
         test()
 
     print("\n" + "=" * 60)
